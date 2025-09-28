@@ -1,30 +1,34 @@
 /*
-  ESP32 + DTSU666 (RS485/Modbus RTU) -> mini WWW z odczytami + SSR burst-fire
+  ESP32 + DTSU666 (RS485/Modbus RTU) -> mini WWW + automatyczne sterowanie grzałką
+  UPROSZCZONE: tylko pobór z sieci + moc grzałki
+
   - WiFi: TP-Link_E6D1 / 80246459
   - Statyczny IP: 192.168.255.50
-  - UART RS485: Serial2  (RX=16, TX=17)
-  - DE/RE: GPIO4
+  - RS485 (DTSU666): Serial2  (RX=16, TX=17), DE/RE=GPIO4
   - Modbus: 9600 bps, O-8-1, slave id = 1
   - Biblioteka: ModbusMaster (Doc Walker)
 
-  Dodatkowo:
-  - SSR_IN+: GPIO13 (D13)
-  - SSR_IN-: GND
-  - Burst-fire (półokresy 50Hz ~= 10 ms)
-  - EMA filter dla płynnego narastania mocy
+  Rejestry:
+  - 0x2012: Total active power (float32 w 0.1 W) -> /10 => W
+    Konwencja: +W = pobór z sieci, -W = eksport do sieci
+
+  Sterowanie:
+  - SSR IN+ = GPIO13, IN- = GND (zalecany driver tranzystorowy)
+  - Burst-fire: okno 1 s, 100 półokresów (50 Hz)
+  - EMA asymetryczne: τ_up=5 s (łagodny wzrost), τ_down=1 s (szybki spadek przy imporcie)
 */
 
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ModbusMaster.h>
 
-//////////////// Wi-Fi ////////////////
+//////////////////// KONFIG Wi-Fi ////////////////////
 const char* WIFI_SSID = "TP-Link_E6D1";
 const char* WIFI_PASS = "80246459";
 IPAddress local_IP(192,168,255,50), gateway(192,168,255,1),
          subnet(255,255,255,0), dns1(192,168,255,1), dns2(8,8,8,8);
 
-////////////// RS485 / Modbus //////////
+//////////////////// RS485 / Modbus //////////////////
 #define RS485_DE_RE 4
 #define UART_BAUD   9600
 #define SERIAL_MODE SERIAL_8O1
@@ -35,16 +39,17 @@ ModbusMaster node;
 WebServer server(80);
 
 void preTransmission(){ digitalWrite(RS485_DE_RE, HIGH); }
-void postTransmission(){ digitalWrite(RS485_DE_RE, LOW); }
+void postTransmission(){ digitalWrite(RS485_DE_RE, LOW);  }
 
-////////////// Helpers (twoje) /////////////////
-bool readFloat32(uint16_t reg, float& outVal) {
+//////////////////// POMOCNICZE //////////////////////
+bool readFloat32_raw(uint16_t reg, float& outVal) {
+  // DTSU666: float32, hi-word first; skala 0.1 W dla mocy
   for (int i=0;i<2;i++){
     uint8_t r = node.readHoldingRegisters(reg, 2);
     if (r == node.ku8MBSuccess){
       uint16_t hi = node.getResponseBuffer(0);
       uint16_t lo = node.getResponseBuffer(1);
-      uint32_t raw = ((uint32_t)hi << 16) | lo; // w razie „kosmosu" zamień na (lo<<16)|hi
+      uint32_t raw = ((uint32_t)hi << 16) | lo; // w razie dziwnych wartości spróbuj (lo<<16)|hi
       memcpy(&outVal, &raw, sizeof(float));
       return true;
     }
@@ -52,151 +57,144 @@ bool readFloat32(uint16_t reg, float& outVal) {
   }
   return false;
 }
-
-bool readFloat32Scaled(uint16_t reg, float scale, float& outVal) {
-  float rawVal;
-  if (readFloat32(reg, rawVal)) {
-    outVal = rawVal / scale;
-    return true;
-  }
+bool readFloat32_scaled(uint16_t reg, float scale, float& outVal){
+  float v;
+  if (readFloat32_raw(reg, v)){ outVal = v / scale; return true; }
   return false;
 }
 
-bool readInt16Scaled(uint16_t reg, float scale, float& outVal){
-  for (int i=0;i<2;i++){
-    uint8_t r = node.readHoldingRegisters(reg, 1);
-    if (r == node.ku8MBSuccess){
-      int16_t raw = (int16_t)node.getResponseBuffer(0);
-      outVal = raw / scale;
-      return true;
-    }
-    delay(5);
-  }
-  return false;
-}
-inline void setIfOk(bool ok, float v, float& dst){ if(ok) dst = v; }
-
-////////////// Dane licznika /////////////////
-struct MeterData {
-  float Ua=0, Ub=0, Uc=0;
-  float Ia=0, Ib=0, Ic=0;
-  float Pt=0, Pa=0, Pb=0, Pc=0;
-  float PFt=0;
-  float Freq=0;
-  float ImpEp_kWh=0, ExpEp_kWh=0;
+//////////////////// DANE ////////////////////
+struct {
+  float Pt = 0.0f;          // W, dodatni=pobór z sieci, ujemny=eksport
   unsigned long lastOkMs=0;
 } md;
 
-unsigned long lastPoll=0;
-void smallPause(){ delay(8); }
+unsigned long lastPoll = 0;
 
 void pollMeter(){
   float v;
-
-  // INT16 + skale - NAPIĘCIA
-  setIfOk(readInt16Scaled(0x2006, 10.0,   v), v, md.Ua); smallPause(); // U L1 [V]
-  setIfOk(readInt16Scaled(0x2008, 10.0,   v), v, md.Ub); smallPause(); // U L2
-  setIfOk(readInt16Scaled(0x200A, 10.0,   v), v, md.Uc); smallPause(); // U L3
-
-  // INT16 + skale - PRĄDY
-  setIfOk(readInt16Scaled(0x200C, 1000.0, v), v, md.Ia); smallPause(); // I L1 [A]
-  setIfOk(readInt16Scaled(0x200E, 1000.0, v), v, md.Ib); smallPause(); // I L2
-  setIfOk(readInt16Scaled(0x2010, 1000.0, v), v, md.Ic); smallPause(); // I L3
-
-  // MOCE – FLOAT32 - DTSU666 zwraca w 0.1W, więc dzielimy przez 10
-  setIfOk(readFloat32Scaled(0x2012, 10.0, v), v, md.Pt); smallPause(); // P Σ [W]
-  setIfOk(readFloat32Scaled(0x2014, 10.0, v), v, md.Pa); smallPause(); // P L1 [W]
-  setIfOk(readFloat32Scaled(0x2016, 10.0, v), v, md.Pb); smallPause(); // P L2 [W]
-  setIfOk(readFloat32Scaled(0x2018, 10.0, v), v, md.Pc); smallPause(); // P L3 [W]
-
-  // PF – INT16 /1000
-  if (readInt16Scaled(0x202A, 1000.0, v)) { md.PFt = constrain(v, -1.0f, 1.0f); }
-  smallPause();
-
-  // Freq – INT16 /100
-  setIfOk(readInt16Scaled(0x2044, 100.0, v), v, md.Freq); smallPause();
-
-  // Energie – FLOAT32 (kWh)
-  setIfOk(readFloat32(0x101E, v), v, md.ImpEp_kWh); smallPause(); // import
-  setIfOk(readFloat32(0x1028, v), v, md.ExpEp_kWh);               // export
-
-  md.lastOkMs = millis();
+  // Total active power (float32 w 0.1 W) => /10 = W
+  if (readFloat32_scaled(0x2012, 10.0f, v)) {
+    md.Pt = v;
+    md.lastOkMs = millis();
+  }
 }
 
-////////////// WWW (Twój HTML) /////////////////
+//////////////////// SSR / KONTROLA ////////////////////
+// Sprzęt
+const int SSR_PIN = 13;                 // D13 -> SSR IN+; SSR IN- -> GND
+// Parametry sterowania
+const float P_MAX = 2000.0f;            // maks. moc grzałki (W)
+const int   WINDOW_SECONDS = 1;         // okno 1 s
+const int   HALF_CYCLES_PER_SECOND = 100; // 50 Hz => 100 półokresów/s
+const int   N_HALF = WINDOW_SECONDS * HALF_CYCLES_PER_SECOND;
+const float TAU_UP   = 5.0f;            // EMA dla wzrostu (sek)
+const float TAU_DOWN = 1.0f;            // EMA dla spadku (sek, szybciej)
+const float IMPORT_DEADBAND_W = 15.0f;  // martwa strefa importu (W)
+
+// Zmienne sterowania
+float P_applied = 0.0f;     // bieżąca moc przyłożona do grzałki (W) po filtrze
+int   on_cycles = 0;        // ile półokresów w oknie ON
+int   phaseIndex = 0;       // indeks półokresu w oknie
+unsigned long lastHalfMillis = 0;
+
+void setupSSR(){
+  pinMode(SSR_PIN, OUTPUT);
+  digitalWrite(SSR_PIN, LOW);
+  phaseIndex = 0;
+  lastHalfMillis = millis();
+  P_applied = 0.0f;
+}
+
+// Wyznacz P_target tylko z aktualnego bilansu:
+// - jeśli eksport (Pt<0): użyj nadwyżki do grzałki
+// - jeśli import (Pt>=0): nie grzej
+float computeTargetPower(){
+  if (md.Pt < 0.0f) {
+    float exportW = -md.Pt;
+    if (exportW > P_MAX) exportW = P_MAX;
+    return exportW;
+  } else {
+    return 0.0f;
+  }
+}
+
+// EMA asymetryczne: szybciej w dół (gdy import) niż w górę (gdy eksport)
+void updateControlWindow(){
+  float P_target = computeTargetPower();
+
+  // import wyraźnie dodatni -> użyj szybkiego opadania (tau_down)
+  bool importing = (md.Pt > IMPORT_DEADBAND_W);
+  float tau = importing ? TAU_DOWN : TAU_UP;
+
+  float k = (float)WINDOW_SECONDS / (tau + (float)WINDOW_SECONDS);
+  if (k < 0.0f) k = 0.0f; if (k > 1.0f) k = 1.0f;
+
+  // EMA
+  P_applied = P_applied + k * (P_target - P_applied);
+  if (P_applied < 0.0f) P_applied = 0.0f;
+  if (P_applied > P_MAX) P_applied = P_MAX;
+
+  // Duty -> ilość półokresów w oknie
+  float duty = P_applied / P_MAX;              // 0..1
+  on_cycles = (int)round(duty * N_HALF);       // 0..N_HALF
+  if (on_cycles < 0) on_cycles = 0;
+  if (on_cycles > N_HALF) on_cycles = N_HALF;
+}
+
+// Tyka co ok. 10 ms (półokres 50 Hz), bez blokowania
+void halfCycleTick(){
+  const unsigned long HALF_MS = 10; // ~10 ms
+  unsigned long now = millis();
+  if (now - lastHalfMillis >= HALF_MS){
+    lastHalfMillis += HALF_MS;
+
+    // Początek okna -> przelicz filtr i on_cycles
+    if (phaseIndex == 0) updateControlWindow();
+
+    // Ustaw SSR w tym półokresie
+    if (phaseIndex < on_cycles) digitalWrite(SSR_PIN, HIGH);
+    else                         digitalWrite(SSR_PIN, LOW);
+
+    // Kolejny półokres
+    phaseIndex++;
+    if (phaseIndex >= N_HALF) phaseIndex = 0;
+  }
+}
+
+//////////////////// WWW ////////////////////
 String htmlPage(){
+  // Minimalny, czytelny panel: pobór + moc grzałki
   String s = R"HTML(
 <!doctype html><html lang="pl"><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>DTSU666 – odczyty</title>
+<title>Bilans i grzałka</title>
 <style>
-:root{ --ok:#0ea37a; --bad:#d64545; --card:#fff; --b:#e5e7eb; }
-body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:16px;background:#fafafa}
-h1{margin:0 0 8px}
-.status{border-radius:16px;padding:14px 16px;margin:6px 0 14px;color:#fff;font-weight:600;display:flex;justify-content:space-between;align-items:center}
+body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;margin:18px;background:#fafafa}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}
+.card{background:#fff;border:1px solid #e5e7eb;border-radius:14px;padding:14px}
+.kv{display:flex;justify-content:space-between;align-items:baseline}
 .mono{font-variant-numeric:tabular-nums}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px}
-.card{background:var(--card);border:1px solid var(--b);border-radius:14px;padding:12px}
-.kv{display:flex;justify-content:space-between;margin:2px 0}
+h1{margin:0 0 10px}
 small{opacity:.6}
-footer{margin-top:12px;opacity:.65}
-.big{font-size:22px}
 </style>
-<h1>DTSU666 – odczyty</h1>
-<div id="status" class="status" style="background:gray">
-  <span id="statusText">Ładowanie…</span>
-  <span class="mono big" id="statusPower">– W</span>
+<h1>Bilans i grzałka</h1>
+<div class="grid">
+  <div class="card"><div class="kv"><b>Pobór z sieci</b><span class="mono" id="imp">– W</span></div></div>
+  <div class="card"><div class="kv"><b>Moc grzałki</b><span class="mono" id="heater">– W</span></div></div>
+  <div class="card"><small>Algorytm: automatyczna dywersja nadwyżki, wzrost wolny / spadek szybki (EMA asymetryczna), okno 1 s.</small></div>
 </div>
-<div class="grid" id="grid"></div>
-<footer><small>Odświeżanie co 2 s • ESP32</small></footer>
 <script>
-function fmt(v,d=2){return Number(v).toFixed(d)}
-function render(j){
-  const sEl=document.getElementById('status');
-  const tEl=document.getElementById('statusText');
-  const pEl=document.getElementById('statusPower');
-  const pt=Number(j.Pt);
-  const dead=1; // Próg martwej strefy w watach (teraz prawidłowy)
-
-  if(pt<-dead){
-    sEl.style.background='var(--ok)';
-    tEl.textContent='Nadwyżka prądu (oddajesz do sieci)';
-  }
-  else if(pt>dead){
-    sEl.style.background='var(--bad)';
-    tEl.textContent='Pobierany prąd (pobór z sieci)';
-  }
-  else{
-    sEl.style.background='gray';
-    tEl.textContent='Bilans ~0 W';
-  }
-
-  pEl.textContent=(pt<0?'':'+') + fmt(pt,1) + ' W';
-
-  const g=document.getElementById('grid');
-  const S=(k,v,u='')=>`<div class="card"><div class="kv"><b>${k}</b><span class="mono">${v} ${u}</span></div></div>`;
-  g.innerHTML =
-    S('Napięcie L1', fmt(j.Ua,1),'V') +
-    S('Napięcie L2', fmt(j.Ub,1),'V') +
-    S('Napięcie L3', fmt(j.Uc,1),'V') +
-    S('Prąd L1', fmt(j.Ia,3),'A') +
-    S('Prąd L2', fmt(j.Ib,3),'A') +
-    S('Prąd L3', fmt(j.Ic,3),'A') +
-    S('Moc chwilowa Σ', fmt(j.Pt,1),'W') +
-    S('Moc L1', fmt(j.Pa,1),'W') +
-    S('Moc L2', fmt(j.Pb,1),'W') +
-    S('Moc L3', fmt(j.Pc,1),'W') +
-    S('Cos φ (Σ)', fmt(j.PFt,3)) +
-    S('Częstotliwość', fmt(j.Freq,2),'Hz') +
-    S('Energia import', fmt(j.ImpEp_kWh,3),'kWh') +
-    S('Energia export', fmt(j.ExpEp_kWh,3),'kWh') +
-    `<div class="card"><div class="kv"><b>Ostatnia aktualizacja</b><span class="mono">${new Date().toLocaleTimeString()}</span></div></div>`;
-}
+function fmt(v,d=1){return Number(v).toFixed(d)}
 async function tick(){
-  try{ const r=await fetch('/data.json'); const j=await r.json(); render(j); }
-  catch(e){ document.getElementById('statusText').textContent='Błąd pobierania danych…'; }
+  try{
+    const r = await fetch('/data.json');
+    const j = await r.json();
+    document.getElementById('imp').textContent    = fmt(Math.max(0, j.grid_import_W),1)+' W';
+    document.getElementById('heater').textContent = fmt(j.heater_W,1)+' W';
+  }catch(e){}
 }
-setInterval(tick,2000); tick();
+setInterval(tick, 1000); tick();
 </script>
 </html>
 )HTML";
@@ -205,165 +203,59 @@ setInterval(tick,2000); tick();
 
 void handleRoot(){ server.send(200,"text/html; charset=utf-8", htmlPage()); }
 
-void handleJSON(){
-  char buf[1024];
+void handleData(){
+  float grid_import_W = md.Pt > 0 ? md.Pt : 0.0f; // tylko dodatnie (pobór)
+  char buf[256];
   snprintf(buf, sizeof(buf),
-    "{\"Ua\":%.3f,\"Ub\":%.3f,\"Uc\":%.3f,"
-    "\"Ia\":%.6f,\"Ib\":%.6f,\"Ic\":%.6f,"
-    "\"Pt\":%.3f,\"Pa\":%.3f,\"Pb\":%.3f,\"Pc\":%.3f,"
-    "\"PFt\":%.6f,\"Freq\":%.3f,"
-    "\"ImpEp_kWh\":%.6f,\"ExpEp_kWh\":%.6f,"
-    "\"P_target\":%.1f,\"P_applied\":%.1f}",
-    md.Ua,md.Ub,md.Uc,
-    md.Ia,md.Ib,md.Ic,
-    md.Pt,md.Pa,md.Pb,md.Pc,
-    md.PFt,md.Freq,
-    md.ImpEp_kWh, md.ExpEp_kWh,
-    0.0, // placeholder, overwritten below
-    0.0
+    "{\"grid_import_W\":%.1f,\"heater_W\":%.1f}",
+    grid_import_W, P_applied
   );
-
-  // Rebuild JSON to inject dynamic P_target/P_applied (avoids big snprintf)
-  // We'll compute them here:
-  float P_target = 0.0; // export (W)
-  if (md.Pt < 0.0) P_target = -md.Pt; // eksport
-  // P_applied will be updated in control loop but show last known:
-  extern float G_P_applied;
-  float P_applied = G_P_applied;
-
-  char buf2[1400];
-  snprintf(buf2, sizeof(buf2),
-    "{\"Ua\":%.3f,\"Ub\":%.3f,\"Uc\":%.3f,"
-    "\"Ia\":%.6f,\"Ib\":%.6f,\"Ic\":%.6f,"
-    "\"Pt\":%.3f,\"Pa\":%.3f,\"Pb\":%.3f,\"Pc\":%.3f,"
-    "\"PFt\":%.6f,\"Freq\":%.3f,"
-    "\"ImpEp_kWh\":%.6f,\"ExpEp_kWh\":%.6f,"
-    "\"P_target\":%.1f,\"P_applied\":%.1f}",
-    md.Ua,md.Ub,md.Uc,
-    md.Ia,md.Ib,md.Ic,
-    md.Pt,md.Pa,md.Pb,md.Pc,
-    md.PFt,md.Freq,
-    md.ImpEp_kWh, md.ExpEp_kWh,
-    P_target, P_applied
-  );
-
-  server.send(200,"application/json; charset=utf-8", buf2);
+  server.send(200,"application/json; charset=utf-8", buf);
 }
 
-//////////////////// SSR / CONTROL ////////////////////
-// SSR pin
-const int SSR_PIN = 13; // D13 -> IN+, IN- -> GND
-
-// Burst-fire parameters
-const int WINDOW_SECONDS = 1;     // okno sterowania (s)
-const int HALF_CYCLES_PER_SECOND = 100; // 50Hz -> 100 półokresów/s
-const int N_HALF = WINDOW_SECONDS * HALF_CYCLES_PER_SECOND; // liczba półokresów w oknie
-const float P_MAX = 2000.0; // max moc grzałki (W)
-
-// EMA (filtr) - stała czasu (s)
-const float TAU_SECONDS = 5.0; // stała czasu wygładzania (reguluj)
-float G_P_applied = 0.0; // aktualnie przyłożona moc (W), globalny odczytowany w JSON
-float last_window_update_time = 0;
-int phaseIndex = 0; // 0 .. N_HALF-1 (półokresów)
-unsigned long lastHalfMillis = 0;
-int on_cycles = 0; // ile półokresów w bieżącym oknie ma być ON
-
-void setupSSR(){
-  pinMode(SSR_PIN, OUTPUT);
-  digitalWrite(SSR_PIN, LOW); // start OFF
-  lastHalfMillis = millis();
-  phaseIndex = 0;
-  last_window_update_time = millis();
-  G_P_applied = 0.0;
-}
-
-void updateControlWindow(){ 
-  // Wywołuj raz na okno (co WINDOW_SECONDS) lub na początek okna (phaseIndex == 0)
-  // Wyznacz P_target z md.Pt
-  float P_target = 0.0;
-  if (md.Pt < 0.0) P_target = -md.Pt;
-  if (P_target > P_MAX) P_target = P_MAX;
-
-  // k = dt / (tau + dt), dt = WINDOW_SECONDS
-  float k = (float)WINDOW_SECONDS / (TAU_SECONDS + (float)WINDOW_SECONDS);
-  // EMA update
-  G_P_applied = G_P_applied + k * (P_target - G_P_applied);
-
-  // compute duty and on_cycles
-  float duty = constrain(G_P_applied / P_MAX, 0.0, 1.0);
-  on_cycles = (int)round(duty * N_HALF);
-  if (on_cycles < 0) on_cycles = 0;
-  if (on_cycles > N_HALF) on_cycles = N_HALF;
-
-  // Debug
-  // Serial.printf("Window update: P_target=%.1f P_applied=%.1f duty=%.3f on_cycles=%d\n", P_target, G_P_applied, duty, on_cycles);
-}
-
-// Called every ~10 ms to progress half-cycle and set SSR accordingly (non-blocking)
-void halfCycleTick(){
-  unsigned long now = millis();
-  // half period ~10 ms (50Hz -> 20 ms full period -> half = 10ms)
-  const unsigned long HALF_MS = 10;
-  if (now - lastHalfMillis >= HALF_MS){
-    lastHalfMillis += HALF_MS;
-    phaseIndex++;
-    if (phaseIndex >= N_HALF){ // nowy window
-      phaseIndex = 0;
-      // update EMA and on_cycles at start of window
-      updateControlWindow();
-    }
-    // set SSR based on whether this half-cycle is within on_cycles
-    if (phaseIndex < on_cycles) digitalWrite(SSR_PIN, HIGH);
-    else digitalWrite(SSR_PIN, LOW);
-  }
-}
-
-///////////////////// setup / loop /////////////////////
+//////////////////// SETUP / LOOP ////////////////////
 void setup(){
   Serial.begin(115200);
   delay(200);
-  Serial.println("DTSU666 + SSR controller starting...");
 
   pinMode(RS485_DE_RE, OUTPUT);
   digitalWrite(RS485_DE_RE, LOW);
 
-  RS485.begin(UART_BAUD, SERIAL_MODE, 16, 17);
+  RS485.begin(UART_BAUD, SERIAL_MODE, 16, 17); // RX=16, TX=17
   RS485.setTimeout(500);
   node.begin(METER_ID, RS485);
   node.preTransmission(preTransmission);
   node.postTransmission(postTransmission);
 
-  // WiFi
+  // Wi-Fi
   WiFi.mode(WIFI_STA);
   WiFi.config(local_IP, gateway, subnet, dns1, dns2);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   unsigned long t0 = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) delay(200);
 
-  // server endpoints
+  // WWW
   server.on("/", handleRoot);
-  server.on("/data.json", handleJSON);
+  server.on("/data.json", handleData);
   server.begin();
 
-  // SSR init
+  // SSR
   setupSSR();
 
-  // initial read
+  // Pierwszy odczyt + start
   pollMeter();
-  // immediately compute control window
   updateControlWindow();
 }
 
 void loop(){
   server.handleClient();
 
-  // regular meter polling (2s)
-  if (millis() - lastPoll > 2000) {
+  // Odczyt mocy co ~500 ms (szybciej, żeby feedback był żywszy)
+  if (millis() - lastPoll > 500) {
     lastPoll = millis();
     pollMeter();
-    // optional: recompute P_target earlier (we update on window start anyway)
   }
 
-  // half-cycle tick - non-blocking, must be called frequently
+  // Sterowanie burst-fire
   halfCycleTick();
 }
