@@ -1,8 +1,12 @@
 /*
   ESP32 + DTSU666 (RS485/Modbus RTU) -> WWW: import/eksport + SSR burst-fire + AUTO/MANUAL + wykres 60 s
-  ZMIANY:
+  LOGIKA SCHODKOWA (z pamięcią stanu):
     - Rezerwa eksportu: min 100 W (EXPORT_RESERVE_W)
-    - Krok reakcji w AUTO: 100 W (STEP_W), kwantyzacja co 100 W
+    - AUTO:
+        * eksport < 100 W  -> natychmiast -100 W
+        * eksport ≥ 200 W  -> +100 W (max 1 raz / ~1 s)
+        * 100..199 W       -> bez zmian
+    - EMA tylko przy wzroście mocy; przy spadku natychmiastowa zmiana
 
   Sieć:    TP-Link_E6D1 / 80246459
   IP:      192.168.255.50 (statyczne)
@@ -12,7 +16,7 @@
            (+) pobór z sieci, (−) eksport do sieci
 
   SSR:     SSR IN+ = GPIO13, IN− = GND (zalecany driver tranzystorowy)
-  Ster.:   EMA (tau_up=5s, tau_down=1s), okno 1 s, burst-fire 50 Hz (10 ms)
+  Ster.:   okno 1 s, burst-fire 50 Hz (10 ms)
 */
 
 #include <WiFi.h>
@@ -45,7 +49,7 @@ bool readFloat32_raw(uint16_t reg, float& outVal) {
     if (r == node.ku8MBSuccess){
       uint16_t hi = node.getResponseBuffer(0);
       uint16_t lo = node.getResponseBuffer(1);
-      uint32_t raw = ((uint32_t)hi << 16) | lo; // jeśli „kosmos”, spróbuj (lo<<16)|hi
+      uint32_t raw = ((uint32_t)hi << 16) | lo; // przy dziwnych wynikach spróbuj (lo<<16)|hi
       memcpy(&outVal, &raw, sizeof(float));
       return true;
     }
@@ -85,22 +89,25 @@ const int   WINDOW_SECONDS = 1;         // okno 1 s
 const int   HALF_CYCLES_PER_SECOND = 100; // 50 Hz -> 100 półokresów
 const int   N_HALF = WINDOW_SECONDS * HALF_CYCLES_PER_SECOND;
 
-// Filtr i logika importu
-const float TAU_UP   = 5.0f;            // EMA wzrost (sek) – łagodnie
-const float TAU_DOWN = 1.0f;            // EMA spadek (sek) – szybciej przy imporcie
-const float IMPORT_DEADBAND_W = 15.0f;  // martwa strefa importu (W)
-
-// NOWE: rezerwa i krok w AUTO
+// Logika AUTO
 const float EXPORT_RESERVE_W = 100.0f;  // zawsze zachowaj min. 100 W eksportu
-const float STEP_W           = 100.0f;  // reaguj/cofaj w skokach 100 W
+const float STEP_W           = 100.0f;  // wielkość schodka
+const unsigned long INC_COOLDOWN_MS = 1000; // min. odstęp czasu między kolejnymi +100 W
+
+// Filtr dla wzrostu (łagodne dochodzenie); spadek robimy natychmiast
+const float TAU_UP = 5.0f; // sek
 
 // Tryb i wartości
 bool  autoMode = true;     // AUTO: z exportu; MANUAL: z suwaka
 float manualDuty = 0.0f;   // 0..1 (tylko MANUAL)
-float P_applied = 0.0f;    // W, po filtrze
+
+// Stan sterowania
+float P_step    = 0.0f;    // docelowa moc schodkowa (0..P_MAX), pamięć stanu
+float P_applied = 0.0f;    // faktycznie przykładana (po filtrze wzrostowym)
 int   on_cycles = 0;
 int   phaseIndex = 0;
 unsigned long lastHalfMillis = 0;
+unsigned long lastIncMs = 0;
 
 void setupSSR(){
   pinMode(SSR_PIN, OUTPUT);
@@ -108,25 +115,41 @@ void setupSSR(){
   phaseIndex = 0;
   lastHalfMillis = millis();
   P_applied = 0.0f;
+  P_step = 0.0f;
 }
 
-static inline float quantizeStep(float w){
-  // Kwantyzacja do dołu co 100 W (0,100,200,...)
-  if (w <= 0.0f) return 0.0f;
-  return floor(w / STEP_W) * STEP_W;
+void updateStepFromExport(){
+  if (!autoMode) return;
+
+  const float exportW = (md.Pt < 0.0f) ? -md.Pt : 0.0f;
+
+  // 1) poniżej rezerwy -> natychmiast -100 W
+  if (exportW < EXPORT_RESERVE_W - 0.5f) { // mała histereza pomiarowa
+    if (P_step >= STEP_W) P_step -= STEP_W;
+    else P_step = 0.0f;
+    return; // odejmujemy od razu i kończymy (kolejne odjęcia oceni następny pomiar)
+  }
+
+  // 2) powyżej progu +100 W nad rezerwą -> +100 W, ale nie częściej niż co 1 s
+  if (exportW >= EXPORT_RESERVE_W + STEP_W - 0.5f) {
+    unsigned long now = millis();
+    if (now - lastIncMs >= INC_COOLDOWN_MS) {
+      P_step += STEP_W;
+      if (P_step > P_MAX) P_step = P_MAX;
+      lastIncMs = now;
+    }
+  }
+  // 3) w paśmie 100..199 W -> bez zmian (trzymamy pamięć stanu)
 }
 
 float computeTargetPower(){
   if (autoMode) {
-    // eksport => budżet = export - rezerwa (min 0), potem kwantyzacja co 100 W
-    const float exportW = (md.Pt < 0.0f) ? -md.Pt : 0.0f;
-    float budget = exportW - EXPORT_RESERVE_W; // zostaw 100 W na liczniku
-    if (budget < 0) budget = 0;
-    float P_target = quantizeStep(budget);
-    if (P_target > P_MAX) P_target = P_MAX;
-    return P_target;
+    // AUTO: korzystamy z pamięci stanu (P_step)
+    if (P_step < 0) P_step = 0;
+    if (P_step > P_MAX) P_step = P_MAX;
+    return P_step;
   } else {
-    // Manual: z suwaka (ciągły); jeśli wolisz też skokowo, użyj quantizeStep(...)
+    // MANUAL: suwak 0..100%
     float P_target = constrain(manualDuty, 0.0f, 1.0f) * P_MAX;
     return P_target;
   }
@@ -135,14 +158,17 @@ float computeTargetPower(){
 void updateControlWindow(){
   float P_target = computeTargetPower();
 
-  // Import wyraźny? → szybkie wygaszanie
-  bool importing = (md.Pt > IMPORT_DEADBAND_W);
-  float tau = importing ? TAU_DOWN : TAU_UP;
-  float k = (float)WINDOW_SECONDS / (tau + (float)WINDOW_SECONDS);
-  if (k < 0.0f) k = 0.0f; if (k > 1.0f) k = 1.0f;
+  // Spadek -> natychmiastowe zejście (brak EMA w dół)
+  if (P_target < P_applied) {
+    P_applied = P_target;
+  } else {
+    // Wzrost -> łagodne dochodzenie (EMA)
+    float k = (float)WINDOW_SECONDS / (TAU_UP + (float)WINDOW_SECONDS);
+    if (k < 0.0f) k = 0.0f; if (k > 1.0f) k = 1.0f;
+    P_applied = P_applied + k * (P_target - P_applied);
+  }
 
-  // EMA
-  P_applied = P_applied + k * (P_target - P_applied);
+  // Ograniczenia
   if (P_applied < 0.0f) P_applied = 0.0f;
   if (P_applied > P_MAX) P_applied = P_MAX;
 
@@ -225,7 +251,7 @@ small{opacity:.6}
 <script>
 function fmt(v,d=1){return Number(v).toFixed(d)}
 
-// proste wykresy na canvas
+// wykres bez bibliotek
 function drawSeries(canvas, data, maxY, color){
   const ctx = canvas.getContext('2d');
   const W = canvas.width, H = canvas.height;
@@ -267,6 +293,11 @@ function applyUI(){
   byId('heater').textContent  = fmt(state.heater_W,1)+' W';
 }
 
+function drawAll(){
+  drawSeries(byId('cHeater'), histHeater, 2000, '#0ea37a');
+  drawSeries(byId('cImport'), histImport, 3000, '#d64545');
+}
+
 async function fetchAll(){
   const [d, c] = await Promise.all([
     fetch('/data.json').then(r=>r.json()),
@@ -284,8 +315,7 @@ async function fetchAll(){
   histImport.push(state.grid_import_W); if(histImport.length>60) histImport.shift();
 
   applyUI();
-  drawSeries(byId('cHeater'), histHeater, 2000, '#0ea37a');
-  drawSeries(byId('cImport'), histImport, 3000, '#d64545');
+  drawAll();
 }
 
 async function setCtrl(params){
@@ -397,18 +427,20 @@ void setup(){
 
   // Start
   pollMeter();
+  updateStepFromExport();   // inicjalizuj stan schodka na podstawie pierwszego pomiaru
   updateControlWindow();
 }
 
 void loop(){
   server.handleClient();
 
-  // Odczyt mocy co 1 s (dla wykresów 60 s)
+  // Odczyt i aktualizacja stanu co 1 s
   if (millis() - lastPoll > 1000) {
     lastPoll = millis();
     pollMeter();
+    updateStepFromExport(); // decyzja: +100 / -100 / bez zmiany
   }
 
-  // Sterowanie burst-fire
+  // Sterowanie burst-fire (10 ms)
   halfCycleTick();
 }
