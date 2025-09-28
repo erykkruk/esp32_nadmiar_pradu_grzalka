@@ -1,13 +1,17 @@
 /*
-  ESP32 + DTSU666 (RS485/Modbus RTU) -> mini WWW z odczytami (typy + skale OK)
+  ESP32 + DTSU666 (RS485/Modbus RTU) -> mini WWW z odczytami + SSR burst-fire
   - WiFi: TP-Link_E6D1 / 80246459
   - Statyczny IP: 192.168.255.50
   - UART RS485: Serial2  (RX=16, TX=17)
   - DE/RE: GPIO4
   - Modbus: 9600 bps, O-8-1, slave id = 1
-  Biblioteka: ModbusMaster (Doc Walker)
-  
-  POPRAWKA: Moce dzielone przez 10 (DTSU666 zwraca w 0.1W)
+  - Biblioteka: ModbusMaster (Doc Walker)
+
+  Dodatkowo:
+  - SSR_IN+: GPIO13 (D13)
+  - SSR_IN-: GND
+  - Burst-fire (półokresy 50Hz ~= 10 ms)
+  - EMA filter dla płynnego narastania mocy
 */
 
 #include <WiFi.h>
@@ -33,7 +37,7 @@ WebServer server(80);
 void preTransmission(){ digitalWrite(RS485_DE_RE, HIGH); }
 void postTransmission(){ digitalWrite(RS485_DE_RE, LOW); }
 
-////////////// Helpers /////////////////
+////////////// Helpers (twoje) /////////////////
 bool readFloat32(uint16_t reg, float& outVal) {
   for (int i=0;i<2;i++){
     uint8_t r = node.readHoldingRegisters(reg, 2);
@@ -72,9 +76,8 @@ bool readInt16Scaled(uint16_t reg, float scale, float& outVal){
 }
 inline void setIfOk(bool ok, float v, float& dst){ if(ok) dst = v; }
 
-////////////// Dane /////////////////
+////////////// Dane licznika /////////////////
 struct MeterData {
-  // skorygowane jednostki: V, A, W, Hz, kWh, PF
   float Ua=0, Ub=0, Uc=0;
   float Ia=0, Ib=0, Ic=0;
   float Pt=0, Pa=0, Pb=0, Pc=0;
@@ -120,7 +123,7 @@ void pollMeter(){
   md.lastOkMs = millis();
 }
 
-////////////// WWW /////////////////
+////////////// WWW (Twój HTML) /////////////////
 String htmlPage(){
   String s = R"HTML(
 <!doctype html><html lang="pl"><meta charset="utf-8">
@@ -152,22 +155,22 @@ function render(j){
   const sEl=document.getElementById('status');
   const tEl=document.getElementById('statusText');
   const pEl=document.getElementById('statusPower');
-  const pt=Number(j.Pt); 
+  const pt=Number(j.Pt);
   const dead=1; // Próg martwej strefy w watach (teraz prawidłowy)
-  
-  if(pt<-dead){ 
-    sEl.style.background='var(--ok)'; 
-    tEl.textContent='Nadwyżka prądu (oddajesz do sieci)'; 
+
+  if(pt<-dead){
+    sEl.style.background='var(--ok)';
+    tEl.textContent='Nadwyżka prądu (oddajesz do sieci)';
   }
-  else if(pt>dead){ 
-    sEl.style.background='var(--bad)'; 
-    tEl.textContent='Pobierany prąd (pobór z sieci)'; 
+  else if(pt>dead){
+    sEl.style.background='var(--bad)';
+    tEl.textContent='Pobierany prąd (pobór z sieci)';
   }
-  else{ 
-    sEl.style.background='gray'; 
-    tEl.textContent='Bilans ~0 W'; 
+  else{
+    sEl.style.background='gray';
+    tEl.textContent='Bilans ~0 W';
   }
-  
+
   pEl.textContent=(pt<0?'':'+') + fmt(pt,1) + ' W';
 
   const g=document.getElementById('grid');
@@ -209,17 +212,118 @@ void handleJSON(){
     "\"Ia\":%.6f,\"Ib\":%.6f,\"Ic\":%.6f,"
     "\"Pt\":%.3f,\"Pa\":%.3f,\"Pb\":%.3f,\"Pc\":%.3f,"
     "\"PFt\":%.6f,\"Freq\":%.3f,"
-    "\"ImpEp_kWh\":%.6f,\"ExpEp_kWh\":%.6f}",
+    "\"ImpEp_kWh\":%.6f,\"ExpEp_kWh\":%.6f,"
+    "\"P_target\":%.1f,\"P_applied\":%.1f}",
     md.Ua,md.Ub,md.Uc,
     md.Ia,md.Ib,md.Ic,
     md.Pt,md.Pa,md.Pb,md.Pc,
     md.PFt,md.Freq,
-    md.ImpEp_kWh, md.ExpEp_kWh
+    md.ImpEp_kWh, md.ExpEp_kWh,
+    0.0, // placeholder, overwritten below
+    0.0
   );
-  server.send(200,"application/json; charset=utf-8", buf);
+
+  // Rebuild JSON to inject dynamic P_target/P_applied (avoids big snprintf)
+  // We'll compute them here:
+  float P_target = 0.0; // export (W)
+  if (md.Pt < 0.0) P_target = -md.Pt; // eksport
+  // P_applied will be updated in control loop but show last known:
+  extern float G_P_applied;
+  float P_applied = G_P_applied;
+
+  char buf2[1400];
+  snprintf(buf2, sizeof(buf2),
+    "{\"Ua\":%.3f,\"Ub\":%.3f,\"Uc\":%.3f,"
+    "\"Ia\":%.6f,\"Ib\":%.6f,\"Ic\":%.6f,"
+    "\"Pt\":%.3f,\"Pa\":%.3f,\"Pb\":%.3f,\"Pc\":%.3f,"
+    "\"PFt\":%.6f,\"Freq\":%.3f,"
+    "\"ImpEp_kWh\":%.6f,\"ExpEp_kWh\":%.6f,"
+    "\"P_target\":%.1f,\"P_applied\":%.1f}",
+    md.Ua,md.Ub,md.Uc,
+    md.Ia,md.Ib,md.Ic,
+    md.Pt,md.Pa,md.Pb,md.Pc,
+    md.PFt,md.Freq,
+    md.ImpEp_kWh, md.ExpEp_kWh,
+    P_target, P_applied
+  );
+
+  server.send(200,"application/json; charset=utf-8", buf2);
 }
 
+//////////////////// SSR / CONTROL ////////////////////
+// SSR pin
+const int SSR_PIN = 13; // D13 -> IN+, IN- -> GND
+
+// Burst-fire parameters
+const int WINDOW_SECONDS = 1;     // okno sterowania (s)
+const int HALF_CYCLES_PER_SECOND = 100; // 50Hz -> 100 półokresów/s
+const int N_HALF = WINDOW_SECONDS * HALF_CYCLES_PER_SECOND; // liczba półokresów w oknie
+const float P_MAX = 2000.0; // max moc grzałki (W)
+
+// EMA (filtr) - stała czasu (s)
+const float TAU_SECONDS = 5.0; // stała czasu wygładzania (reguluj)
+float G_P_applied = 0.0; // aktualnie przyłożona moc (W), globalny odczytowany w JSON
+float last_window_update_time = 0;
+int phaseIndex = 0; // 0 .. N_HALF-1 (półokresów)
+unsigned long lastHalfMillis = 0;
+int on_cycles = 0; // ile półokresów w bieżącym oknie ma być ON
+
+void setupSSR(){
+  pinMode(SSR_PIN, OUTPUT);
+  digitalWrite(SSR_PIN, LOW); // start OFF
+  lastHalfMillis = millis();
+  phaseIndex = 0;
+  last_window_update_time = millis();
+  G_P_applied = 0.0;
+}
+
+void updateControlWindow(){ 
+  // Wywołuj raz na okno (co WINDOW_SECONDS) lub na początek okna (phaseIndex == 0)
+  // Wyznacz P_target z md.Pt
+  float P_target = 0.0;
+  if (md.Pt < 0.0) P_target = -md.Pt;
+  if (P_target > P_MAX) P_target = P_MAX;
+
+  // k = dt / (tau + dt), dt = WINDOW_SECONDS
+  float k = (float)WINDOW_SECONDS / (TAU_SECONDS + (float)WINDOW_SECONDS);
+  // EMA update
+  G_P_applied = G_P_applied + k * (P_target - G_P_applied);
+
+  // compute duty and on_cycles
+  float duty = constrain(G_P_applied / P_MAX, 0.0, 1.0);
+  on_cycles = (int)round(duty * N_HALF);
+  if (on_cycles < 0) on_cycles = 0;
+  if (on_cycles > N_HALF) on_cycles = N_HALF;
+
+  // Debug
+  // Serial.printf("Window update: P_target=%.1f P_applied=%.1f duty=%.3f on_cycles=%d\n", P_target, G_P_applied, duty, on_cycles);
+}
+
+// Called every ~10 ms to progress half-cycle and set SSR accordingly (non-blocking)
+void halfCycleTick(){
+  unsigned long now = millis();
+  // half period ~10 ms (50Hz -> 20 ms full period -> half = 10ms)
+  const unsigned long HALF_MS = 10;
+  if (now - lastHalfMillis >= HALF_MS){
+    lastHalfMillis += HALF_MS;
+    phaseIndex++;
+    if (phaseIndex >= N_HALF){ // nowy window
+      phaseIndex = 0;
+      // update EMA and on_cycles at start of window
+      updateControlWindow();
+    }
+    // set SSR based on whether this half-cycle is within on_cycles
+    if (phaseIndex < on_cycles) digitalWrite(SSR_PIN, HIGH);
+    else digitalWrite(SSR_PIN, LOW);
+  }
+}
+
+///////////////////// setup / loop /////////////////////
 void setup(){
+  Serial.begin(115200);
+  delay(200);
+  Serial.println("DTSU666 + SSR controller starting...");
+
   pinMode(RS485_DE_RE, OUTPUT);
   digitalWrite(RS485_DE_RE, LOW);
 
@@ -229,20 +333,37 @@ void setup(){
   node.preTransmission(preTransmission);
   node.postTransmission(postTransmission);
 
+  // WiFi
   WiFi.mode(WIFI_STA);
   WiFi.config(local_IP, gateway, subnet, dns1, dns2);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   unsigned long t0 = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) delay(200);
 
+  // server endpoints
   server.on("/", handleRoot);
   server.on("/data.json", handleJSON);
   server.begin();
 
+  // SSR init
+  setupSSR();
+
+  // initial read
   pollMeter();
+  // immediately compute control window
+  updateControlWindow();
 }
 
 void loop(){
   server.handleClient();
-  if (millis() - lastPoll > 2000) { lastPoll = millis(); pollMeter(); }
+
+  // regular meter polling (2s)
+  if (millis() - lastPoll > 2000) {
+    lastPoll = millis();
+    pollMeter();
+    // optional: recompute P_target earlier (we update on window start anyway)
+  }
+
+  // half-cycle tick - non-blocking, must be called frequently
+  halfCycleTick();
 }
