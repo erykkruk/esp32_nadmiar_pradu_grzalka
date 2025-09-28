@@ -6,6 +6,8 @@
   - DE/RE: GPIO4
   - Modbus: 9600 bps, O-8-1, slave id = 1
   Biblioteka: ModbusMaster (Doc Walker)
+  
+  POPRAWKA: Moce dzielone przez 10 (DTSU666 zwraca w 0.1W)
 */
 
 #include <WiFi.h>
@@ -38,7 +40,7 @@ bool readFloat32(uint16_t reg, float& outVal) {
     if (r == node.ku8MBSuccess){
       uint16_t hi = node.getResponseBuffer(0);
       uint16_t lo = node.getResponseBuffer(1);
-      uint32_t raw = ((uint32_t)hi << 16) | lo; // w razie „kosmosu” zamień na (lo<<16)|hi
+      uint32_t raw = ((uint32_t)hi << 16) | lo; // w razie „kosmosu" zamień na (lo<<16)|hi
       memcpy(&outVal, &raw, sizeof(float));
       return true;
     }
@@ -46,6 +48,16 @@ bool readFloat32(uint16_t reg, float& outVal) {
   }
   return false;
 }
+
+bool readFloat32Scaled(uint16_t reg, float scale, float& outVal) {
+  float rawVal;
+  if (readFloat32(reg, rawVal)) {
+    outVal = rawVal / scale;
+    return true;
+  }
+  return false;
+}
+
 bool readInt16Scaled(uint16_t reg, float scale, float& outVal){
   for (int i=0;i<2;i++){
     uint8_t r = node.readHoldingRegisters(reg, 1);
@@ -78,20 +90,21 @@ void smallPause(){ delay(8); }
 void pollMeter(){
   float v;
 
-  // INT16 + skale
+  // INT16 + skale - NAPIĘCIA
   setIfOk(readInt16Scaled(0x2006, 10.0,   v), v, md.Ua); smallPause(); // U L1 [V]
   setIfOk(readInt16Scaled(0x2008, 10.0,   v), v, md.Ub); smallPause(); // U L2
   setIfOk(readInt16Scaled(0x200A, 10.0,   v), v, md.Uc); smallPause(); // U L3
 
+  // INT16 + skale - PRĄDY
   setIfOk(readInt16Scaled(0x200C, 1000.0, v), v, md.Ia); smallPause(); // I L1 [A]
   setIfOk(readInt16Scaled(0x200E, 1000.0, v), v, md.Ib); smallPause(); // I L2
   setIfOk(readInt16Scaled(0x2010, 1000.0, v), v, md.Ic); smallPause(); // I L3
 
-  // Moce – FLOAT32 (W)
-  setIfOk(readFloat32(0x2012, v), v, md.Pt); smallPause(); // P Σ [W]
-  setIfOk(readFloat32(0x2014, v), v, md.Pa); smallPause(); // P L1
-  setIfOk(readFloat32(0x2016, v), v, md.Pb); smallPause(); // P L2
-  setIfOk(readFloat32(0x2018, v), v, md.Pc); smallPause(); // P L3
+  // MOCE – FLOAT32 - DTSU666 zwraca w 0.1W, więc dzielimy przez 10
+  setIfOk(readFloat32Scaled(0x2012, 10.0, v), v, md.Pt); smallPause(); // P Σ [W]
+  setIfOk(readFloat32Scaled(0x2014, 10.0, v), v, md.Pa); smallPause(); // P L1 [W]
+  setIfOk(readFloat32Scaled(0x2016, 10.0, v), v, md.Pb); smallPause(); // P L2 [W]
+  setIfOk(readFloat32Scaled(0x2018, 10.0, v), v, md.Pc); smallPause(); // P L3 [W]
 
   // PF – INT16 /1000
   if (readInt16Scaled(0x202A, 1000.0, v)) { md.PFt = constrain(v, -1.0f, 1.0f); }
@@ -139,11 +152,23 @@ function render(j){
   const sEl=document.getElementById('status');
   const tEl=document.getElementById('statusText');
   const pEl=document.getElementById('statusPower');
-  const pt=Number(j.Pt); const dead=10;
-  if(pt<-dead){ sEl.style.background='var(--ok)'; tEl.textContent='Nadwyżka prądu (oddajesz do sieci)'; }
-  else if(pt>dead){ sEl.style.background='var(--bad)'; tEl.textContent='Pobierany prąd (pobór z sieci)'; }
-  else{ sEl.style.background='gray'; tEl.textContent='Bilans ~0 W'; }
-  pEl.textContent=(pt<0?'-':'')+fmt(Math.abs(pt),1)+' W';
+  const pt=Number(j.Pt); 
+  const dead=1; // Próg martwej strefy w watach (teraz prawidłowy)
+  
+  if(pt<-dead){ 
+    sEl.style.background='var(--ok)'; 
+    tEl.textContent='Nadwyżka prądu (oddajesz do sieci)'; 
+  }
+  else if(pt>dead){ 
+    sEl.style.background='var(--bad)'; 
+    tEl.textContent='Pobierany prąd (pobór z sieci)'; 
+  }
+  else{ 
+    sEl.style.background='gray'; 
+    tEl.textContent='Bilans ~0 W'; 
+  }
+  
+  pEl.textContent=(pt<0?'':'+') + fmt(pt,1) + ' W';
 
   const g=document.getElementById('grid');
   const S=(k,v,u='')=>`<div class="card"><div class="kv"><b>${k}</b><span class="mono">${v} ${u}</span></div></div>`;
