@@ -1,12 +1,15 @@
 /*
   ESP32 + DTSU666 (RS485/Modbus RTU) -> WWW: import/eksport + SSR burst-fire + AUTO/MANUAL + wykres 60 s
-  LOGIKA SCHODKOWA (z pamięcią stanu):
-    - Rezerwa eksportu: min 100 W (EXPORT_RESERVE_W)
+  LOGIKA SCHODKOWA (z uspokojeniem):
+    - Rezerwa eksportu: min 150 W (EXPORT_RESERVE_W)
+    - Deadband: ±150 W wokół rezerwy (DEADBAND_W)
+    - Krok: 250 W (STEP_W)
     - AUTO:
-        * eksport < 100 W  -> natychmiast -100 W
-        * eksport ≥ 200 W  -> +100 W (max 1 raz / ~1 s)
-        * 100..199 W       -> bez zmian
-    - EMA tylko przy wzroście mocy; przy spadku natychmiastowa zmiana
+        * eksport < (rezerwa - deadband)  -> -250 W (nie częściej niż co DEC_COOLDOWN_MS)
+        * eksport > (rezerwa + deadband)  -> +250 W (nie częściej niż co INC_COOLDOWN_MS)
+        * w strefie martwej               -> bez zmian (pamięć stanu)
+    - EMA na eksporcie (tylko do decyzji schodka); P_applied: EMA tylko w górę, w dół natychmiast
+    - Minimalny czas podtrzymania poziomu po każdej zmianie (MIN_HOLD_MS)
 
   Sieć:    TP-Link_E6D1 / 80246459
   IP:      192.168.255.50 (statyczne)
@@ -71,14 +74,6 @@ struct {
 
 unsigned long lastPoll = 0;
 
-void pollMeter(){
-  float v;
-  if (readFloat32_scaled(0x2012, 10.0f, v)) { // Total active power /10 => W
-    md.Pt = v;
-    md.lastOkMs = millis();
-  }
-}
-
 //////////////////// SSR / Sterowanie //////////////////
 // Sprzęt
 const int SSR_PIN = 13;                 // D13 -> SSR IN+; SSR IN- -> GND
@@ -89,12 +84,18 @@ const int   WINDOW_SECONDS = 1;         // okno 1 s
 const int   HALF_CYCLES_PER_SECOND = 100; // 50 Hz -> 100 półokresów
 const int   N_HALF = WINDOW_SECONDS * HALF_CYCLES_PER_SECOND;
 
-// Logika AUTO
-const float EXPORT_RESERVE_W = 100.0f;  // zawsze zachowaj min. 100 W eksportu
-const float STEP_W           = 100.0f;  // wielkość schodka
-const unsigned long INC_COOLDOWN_MS = 1000; // min. odstęp czasu między kolejnymi +100 W
+// Logika AUTO (uspokojona)
+const float EXPORT_RESERVE_W        = 150.0f;   // rezerwa eksportu
+const float STEP_W                  = 250.0f;   // wielkość schodka
+const float DEADBAND_W              = 150.0f;   // strefa martwa ±150 W
+const unsigned long INC_COOLDOWN_MS = 3000;     // min odstęp między kolejnymi +250 W
+const unsigned long DEC_COOLDOWN_MS = 1500;     // min odstęp między kolejnymi -250 W
+const unsigned long MIN_HOLD_MS     = 3000;     // minimalny czas podtrzymania poziomu po każdej zmianie
 
-// Filtr dla wzrostu (łagodne dochodzenie); spadek robimy natychmiast
+// Filtr na decyzji (EMA na eksporcie)
+const float TAU_EXPORT_DECISIONS = 2.0f;        // sek
+
+// Filtr wzrostu na P_applied; spadek natychmiast
 const float TAU_UP = 5.0f; // sek
 
 // Tryb i wartości
@@ -108,6 +109,12 @@ int   on_cycles = 0;
 int   phaseIndex = 0;
 unsigned long lastHalfMillis = 0;
 unsigned long lastIncMs = 0;
+unsigned long lastDecMs = 0;
+unsigned long lastChangeMs = 0;
+
+// Dodatkowe: przefiltrowany eksport do decyzji
+float exportW_filt = 0.0f;
+bool  exportFiltInit = false;
 
 void setupSSR(){
   pinMode(SSR_PIN, OUTPUT);
@@ -118,38 +125,67 @@ void setupSSR(){
   P_step = 0.0f;
 }
 
+void pollMeter(){
+  float v;
+  if (readFloat32_scaled(0x2012, 10.0f, v)) { // Total active power /10 => W
+    md.Pt = v;
+    md.lastOkMs = millis();
+
+    // surowy eksport (≥0)
+    float exportW_raw = (md.Pt < 0.0f) ? -md.Pt : 0.0f;
+
+    // EMA do decyzji (dwukierunkowa, krótka)
+    if(!exportFiltInit){ exportW_filt = exportW_raw; exportFiltInit = true; }
+    float dt = 1.0f; // bo wołamy co ~1 s
+    float k  = dt / (TAU_EXPORT_DECISIONS + dt);
+    if (k < 0) k = 0; if (k > 1) k = 1;
+    exportW_filt = exportW_filt + k * (exportW_raw - exportW_filt);
+  }
+}
+
 void updateStepFromExport(){
   if (!autoMode) return;
 
-  const float exportW = (md.Pt < 0.0f) ? -md.Pt : 0.0f;
+  const float exportW = exportW_filt; // używamy przefiltrowanego eksportu
+  const unsigned long now = millis();
 
-  // 1) poniżej rezerwy -> natychmiast -100 W
-  if (exportW < EXPORT_RESERVE_W - 0.5f) { // mała histereza pomiarowa
-    if (P_step >= STEP_W) P_step -= STEP_W;
-    else P_step = 0.0f;
-    return; // odejmujemy od razu i kończymy (kolejne odjęcia oceni następny pomiar)
+  const float lowThresh  = EXPORT_RESERVE_W - DEADBAND_W;
+  const float highThresh = EXPORT_RESERVE_W + DEADBAND_W;
+
+  // jeśli nie minęło MIN_HOLD_MS od ostatniej zmiany, nie ruszamy
+  if (now - lastChangeMs < MIN_HOLD_MS) return;
+
+  // Za mały eksport -> zmniejszamy krok (z cooldownem w dół)
+  if (exportW < lowThresh) {
+    if (now - lastDecMs >= DEC_COOLDOWN_MS) {
+      P_step -= STEP_W;
+      if (P_step < 0) P_step = 0;
+      lastDecMs = now;
+      lastChangeMs = now;
+    }
+    return;
   }
 
-  // 2) powyżej progu +100 W nad rezerwą -> +100 W, ale nie częściej niż co 1 s
-  if (exportW >= EXPORT_RESERVE_W + STEP_W - 0.5f) {
-    unsigned long now = millis();
+  // Duży eksport -> zwiększamy krok (z cooldownem w górę)
+  if (exportW > highThresh) {
     if (now - lastIncMs >= INC_COOLDOWN_MS) {
       P_step += STEP_W;
       if (P_step > P_MAX) P_step = P_MAX;
       lastIncMs = now;
+      lastChangeMs = now;
     }
+    return;
   }
-  // 3) w paśmie 100..199 W -> bez zmian (trzymamy pamięć stanu)
+
+  // W strefie martwej: bez zmian
 }
 
 float computeTargetPower(){
   if (autoMode) {
-    // AUTO: korzystamy z pamięci stanu (P_step)
     if (P_step < 0) P_step = 0;
     if (P_step > P_MAX) P_step = P_MAX;
     return P_step;
   } else {
-    // MANUAL: suwak 0..100%
     float P_target = constrain(manualDuty, 0.0f, 1.0f) * P_MAX;
     return P_target;
   }
@@ -158,7 +194,7 @@ float computeTargetPower(){
 void updateControlWindow(){
   float P_target = computeTargetPower();
 
-  // Spadek -> natychmiastowe zejście (brak EMA w dół)
+  // Spadek -> natychmiastowe zejście
   if (P_target < P_applied) {
     P_applied = P_target;
   } else {
@@ -225,8 +261,9 @@ small{opacity:.6}
   <input type="range" id="pct" min="0" max="100" step="1">
   <b id="pctVal" class="mono">0%</b>
   <span class="badge">Tryb: <span id="modeLabel">MANUAL</span></span>
-  <span class="badge">Rezerwa: <span class="mono">100 W</span></span>
-  <span class="badge">Krok AUTO: <span class="mono">100 W</span></span>
+  <span class="badge">Rezerwa: <span class="mono">150 W</span></span>
+  <span class="badge">Deadband: <span class="mono">±150 W</span></span>
+  <span class="badge">Krok AUTO: <span class="mono">250 W</span></span>
   <span class="badge">Zadana: <span class="mono" id="targetW">0 W</span></span>
   <span class="badge">Przyłożona: <span class="mono" id="appliedW">0 W</span></span>
 </div>
@@ -426,7 +463,7 @@ void setup(){
   setupSSR();
 
   // Start
-  pollMeter();
+  pollMeter();              // wstępny odczyt + inicjalizacja filtru eksportu
   updateStepFromExport();   // inicjalizuj stan schodka na podstawie pierwszego pomiaru
   updateControlWindow();
 }
@@ -434,11 +471,11 @@ void setup(){
 void loop(){
   server.handleClient();
 
-  // Odczyt i aktualizacja stanu co 1 s
+  // Odczyt i aktualizacja stanu co ~1 s
   if (millis() - lastPoll > 1000) {
     lastPoll = millis();
     pollMeter();
-    updateStepFromExport(); // decyzja: +100 / -100 / bez zmiany
+    updateStepFromExport(); // decyzja: +250 / -250 / bez zmiany (z histerezą i cooldownami)
   }
 
   // Sterowanie burst-fire (10 ms)
