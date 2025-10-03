@@ -3,9 +3,9 @@
   LOGIKA SCHODKOWA (z pamięcią stanu):
     - Rezerwa eksportu: min 100 W (EXPORT_RESERVE_W)
     - AUTO:
-        * eksport < rezerwy  -> natychmiast -STEP_W (nie poniżej min_w)
-        * eksport ≥ rezerwy + STEP_W -> +STEP_W (max 1 raz / ~1 s)
-        * pomiędzy -> bez zmian (pamięć stanu)
+        * eksport < 100 W  -> natychmiast -100 W
+        * eksport ≥ 200 W  -> +100 W (max 1 raz / ~1 s)
+        * 100..199 W       -> bez zmian
     - EMA tylko przy wzroście mocy; przy spadku natychmiastowa zmiana
 
   Sieć:    TP-Link_E6D1 / 80246459
@@ -84,22 +84,15 @@ void pollMeter(){
 const int SSR_PIN = 13;                 // D13 -> SSR IN+; SSR IN- -> GND
 
 // Parametry główne
-float P_MAX = 2000.0f;                  // maks. moc grzałki (W) — zostawione jako zmienna, jakbyś chciał kiedyś dodać zmianę z UI
+const float P_MAX = 2000.0f;            // maks. moc grzałki (W)
 const int   WINDOW_SECONDS = 1;         // okno 1 s
 const int   HALF_CYCLES_PER_SECOND = 100; // 50 Hz -> 100 półokresów
 const int   N_HALF = WINDOW_SECONDS * HALF_CYCLES_PER_SECOND;
 
-// Logika AUTO (konfigurowalne)
+// Logika AUTO
 const float EXPORT_RESERVE_W = 100.0f;  // zawsze zachowaj min. 100 W eksportu
-float stepW      = 300.0f;              // DOMYŚLNIE 300 W, zmienialne z UI
-float minAutoW   = 200.0f;              // DOMYŚLNIE 200 W, minimalna/floor w trybie AUTO (start i najniższy poziom)
-
-// Ochrona wartości
-const float STEP_MIN = 50.0f;           // minimalny sensowny krok
-const float STEP_MAX = 3000.0f;         // górny limit kroku
-const float MIN_AUTO_W_MIN = 0.0f;      // pozwalamy ustawić 0..P_MAX, ale domyślnie 200
-// Cooldown
-const unsigned long INC_COOLDOWN_MS = 1000; // min. odstęp czasu między kolejnymi +stepW
+const float STEP_W           = 100.0f;  // wielkość schodka
+const unsigned long INC_COOLDOWN_MS = 1000; // min. odstęp czasu między kolejnymi +100 W
 
 // Filtr dla wzrostu (łagodne dochodzenie); spadek robimy natychmiast
 const float TAU_UP = 5.0f; // sek
@@ -109,7 +102,7 @@ bool  autoMode = true;     // AUTO: z exportu; MANUAL: z suwaka
 float manualDuty = 0.0f;   // 0..1 (tylko MANUAL)
 
 // Stan sterowania
-float P_step    = 0.0f;    // docelowa moc schodkowa (0..P_MAX), pamięć stanu (AUTO)
+float P_step    = 0.0f;    // docelowa moc schodkowa (0..P_MAX), pamięć stanu
 float P_applied = 0.0f;    // faktycznie przykładana (po filtrze wzrostowym)
 int   on_cycles = 0;
 int   phaseIndex = 0;
@@ -122,56 +115,38 @@ void setupSSR(){
   phaseIndex = 0;
   lastHalfMillis = millis();
   P_applied = 0.0f;
-  // start w trybie AUTO z floor = minAutoW (domyślnie 200 W)
-  P_step = minAutoW;
-}
-
-void clampAutoFloor(){
-  if (minAutoW < MIN_AUTO_W_MIN) minAutoW = MIN_AUTO_W_MIN;
-  if (minAutoW > P_MAX) minAutoW = P_MAX;
-}
-
-void clampStep(){
-  if (stepW < STEP_MIN) stepW = STEP_MIN;
-  if (stepW > STEP_MAX) stepW = STEP_MAX;
+  P_step = 0.0f;
 }
 
 void updateStepFromExport(){
   if (!autoMode) return;
 
-  clampAutoFloor();
-  clampStep();
-
-  // Zapewnienie, że pamięć stanu nie spadnie poniżej floor
-  if (P_step < minAutoW) P_step = minAutoW;
-
   const float exportW = (md.Pt < 0.0f) ? -md.Pt : 0.0f;
 
-  // 1) poniżej rezerwy -> natychmiast -stepW (ale nie poniżej minAutoW)
-  if (exportW < EXPORT_RESERVE_W - 0.5f) {
-    if (P_step > minAutoW) {
-      float newP = P_step - stepW;
-      P_step = (newP < minAutoW) ? minAutoW : newP;
-    }
-    return;
+  // 1) poniżej rezerwy -> natychmiast -100 W
+  if (exportW < EXPORT_RESERVE_W - 0.5f) { // mała histereza pomiarowa
+    if (P_step >= STEP_W) P_step -= STEP_W;
+    else P_step = 0.0f;
+    return; // odejmujemy od razu i kończymy (kolejne odjęcia oceni następny pomiar)
   }
 
-  // 2) powyżej progu rezerwa+stepW -> +stepW, ale nie częściej niż co 1 s
-  if (exportW >= EXPORT_RESERVE_W + stepW - 0.5f) {
+  // 2) powyżej progu +100 W nad rezerwą -> +100 W, ale nie częściej niż co 1 s
+  if (exportW >= EXPORT_RESERVE_W + STEP_W - 0.5f) {
     unsigned long now = millis();
     if (now - lastIncMs >= INC_COOLDOWN_MS) {
-      P_step += stepW;
+      P_step += STEP_W;
       if (P_step > P_MAX) P_step = P_MAX;
       lastIncMs = now;
     }
   }
-  // 3) w paśmie (rezerwa..rezerwa+stepW) -> bez zmian
+  // 3) w paśmie 100..199 W -> bez zmian (trzymamy pamięć stanu)
 }
 
 float computeTargetPower(){
   if (autoMode) {
-    if (P_step < minAutoW) P_step = minAutoW;
-    if (P_step > P_MAX)    P_step = P_MAX;
+    // AUTO: korzystamy z pamięci stanu (P_step)
+    if (P_step < 0) P_step = 0;
+    if (P_step > P_MAX) P_step = P_MAX;
     return P_step;
   } else {
     // MANUAL: suwak 0..100%
@@ -183,7 +158,7 @@ float computeTargetPower(){
 void updateControlWindow(){
   float P_target = computeTargetPower();
 
-  // Spadek -> natychmiastowe zejście
+  // Spadek -> natychmiastowe zejście (brak EMA w dół)
   if (P_target < P_applied) {
     P_applied = P_target;
   } else {
@@ -241,9 +216,6 @@ h1{margin:0 0 10px}
 .canvasWrap{height:220px}
 canvas{width:100%;height:100%}
 small{opacity:.6}
-input[type=number]{width:110px;padding:6px 8px;border-radius:10px;border:1px solid var(--b)}
-button{padding:7px 12px;border-radius:10px;border:1px solid var(--b);background:#fff;cursor:pointer}
-button:hover{background:#f3f4f6}
 </style>
 
 <h1>Bilans, nadwyżka i grzałka</h1>
@@ -252,27 +224,14 @@ button:hover{background:#f3f4f6}
   <label><input type="checkbox" id="auto"> <b>Automatycznie</b></label>
   <input type="range" id="pct" min="0" max="100" step="1">
   <b id="pctVal" class="mono">0%</b>
-
   <span class="badge">Tryb: <span id="modeLabel">MANUAL</span></span>
   <span class="badge">Rezerwa: <span class="mono">100 W</span></span>
-  <span class="badge">Krok AUTO: <span class="mono" id="stepBadge">– W</span></span>
-  <span class="badge">Min AUTO: <span class="mono" id="minBadge">– W</span></span>
+  <span class="badge">Krok AUTO: <span class="mono">100 W</span></span>
   <span class="badge">Zadana: <span class="mono" id="targetW">0 W</span></span>
   <span class="badge">Przyłożona: <span class="mono" id="appliedW">0 W</span></span>
 </div>
 
-<div class="card ctrl" style="margin-top:12px">
-  <div>
-    <label>Krok (W): <input type="number" id="inStep" min="50" max="3000" step="50"></label>
-  </div>
-  <div>
-    <label>Min AUTO (W): <input type="number" id="inMin" min="0" max="5000" step="50"></label>
-  </div>
-  <button id="applyBtn">Zastosuj</button>
-  <small>Zmiany działają od razu. Domyślnie: krok 300 W, min AUTO 200 W.</small>
-</div>
-
-<div class="grid" style="margin-top:12px">
+<div class="grid">
   <div class="card"><div class="kv"><b>Pobór z sieci</b><span class="mono" id="imp">– W</span></div></div>
   <div class="card"><div class="kv"><b>Nadwyżka (eksport)</b><span class="mono" id="exp">– W</span></div></div>
   <div class="card"><div class="kv"><b>Moc grzałki</b><span class="mono" id="heater">– W</span></div></div>
@@ -314,8 +273,7 @@ function drawSeries(canvas, data, maxY, color){
 
 let state = {
   auto:true, manual_pct:0, P_target:0, P_applied:0,
-  grid_import_W:0, export_W:0, heater_W:0,
-  step_w:300, min_w:200
+  grid_import_W:0, export_W:0, heater_W:0
 };
 let histHeater = new Array(60).fill(0);
 let histImport = new Array(60).fill(0);
@@ -333,10 +291,6 @@ function applyUI(){
   byId('imp').textContent     = fmt(state.grid_import_W,1)+' W';
   byId('exp').textContent     = fmt(state.export_W,1)+' W';
   byId('heater').textContent  = fmt(state.heater_W,1)+' W';
-  byId('stepBadge').textContent = Math.round(state.step_w) + ' W';
-  byId('minBadge').textContent  = Math.round(state.min_w) + ' W';
-  byId('inStep').value = Math.round(state.step_w);
-  byId('inMin').value  = Math.round(state.min_w);
 }
 
 function drawAll(){
@@ -352,13 +306,10 @@ async function fetchAll(){
   state.grid_import_W = d.grid_import_W;
   state.export_W      = d.export_W;
   state.heater_W      = d.heater_W;
-
   state.auto        = c.auto;
   state.manual_pct  = c.manual_pct;
   state.P_target    = c.P_target;
   state.P_applied   = c.P_applied;
-  state.step_w      = c.step_w;
-  state.min_w       = c.min_w;
 
   histHeater.push(state.heater_W); if(histHeater.length>60) histHeater.shift();
   histImport.push(state.grid_import_W); if(histImport.length>60) histImport.shift();
@@ -389,13 +340,6 @@ document.addEventListener('DOMContentLoaded', ()=>{
     fetchAll().catch(()=>{});
   });
 
-  byId('applyBtn').addEventListener('click', async ()=>{
-    const step = byId('inStep').value;
-    const min  = byId('inMin').value;
-    await setCtrl({step_w:step, min_w:min});
-    fetchAll().catch(()=>{});
-  });
-
   fetchAll().catch(()=>{});
   setInterval(()=>fetchAll().catch(()=>{}), 1000);
 });
@@ -423,51 +367,30 @@ void handleData(){
 void handleCtrlJSON(){
   float P_target = computeTargetPower();
   float manual_pct = manualDuty * 100.0f;
-  char buf[480];
+  char buf[400];
   snprintf(buf, sizeof(buf),
     "{\"auto\":%s,\"manual_pct\":%.1f,"
     "\"P_target\":%.1f,\"P_applied\":%.1f,"
-    "\"on_cycles\":%d,\"window_halfcycles\":%d,"
-    "\"step_w\":%.1f,\"min_w\":%.1f}",
+    "\"on_cycles\":%d,\"window_halfcycles\":%d}",
     autoMode?"true":"false", manual_pct,
     P_target, P_applied,
-    on_cycles, N_HALF,
-    stepW, minAutoW
+    on_cycles, N_HALF
   );
   server.send(200, "application/json; charset=utf-8", buf);
 }
 
 // Ustawienia z UI
 void handleSet(){
-  bool changed = false;
-
   if (server.hasArg("mode")){
     String m = server.arg("mode");
-    if (m == "auto")   { autoMode = true;  changed = true; }
-    if (m == "manual") { autoMode = false; changed = true; }
+    if (m == "auto")   autoMode = true;
+    if (m == "manual") autoMode = false;
   }
   if (server.hasArg("duty")){
     int pct = server.arg("duty").toInt();
     if (pct < 0) pct = 0; if (pct > 100) pct = 100;
     manualDuty = pct / 100.0f;
-    changed = true;
   }
-  if (server.hasArg("step_w")){
-    float s = server.arg("step_w").toFloat();
-    stepW = s;
-    clampStep();
-    changed = true;
-  }
-  if (server.hasArg("min_w")){
-    float m = server.arg("min_w").toFloat();
-    minAutoW = m;
-    clampAutoFloor();
-    // Jeśli podnieśliśmy floor powyżej aktualnego P_step — doskocz
-    if (P_step < minAutoW) P_step = minAutoW;
-    changed = true;
-  }
-
-  // Odpowiedz stanem po zmianach
   handleCtrlJSON();
 }
 
@@ -504,7 +427,7 @@ void setup(){
 
   // Start
   pollMeter();
-  updateStepFromExport();   // inicjalizuj stan schodka na podstawie pierwszego pomiaru (uwzględnia minAutoW)
+  updateStepFromExport();   // inicjalizuj stan schodka na podstawie pierwszego pomiaru
   updateControlWindow();
 }
 
@@ -515,7 +438,7 @@ void loop(){
   if (millis() - lastPoll > 1000) {
     lastPoll = millis();
     pollMeter();
-    updateStepFromExport(); // decyzja: +stepW / -stepW / bez zmiany (z floor minAutoW)
+    updateStepFromExport(); // decyzja: +100 / -100 / bez zmiany
   }
 
   // Sterowanie burst-fire (10 ms)
