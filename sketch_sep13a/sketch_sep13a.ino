@@ -90,9 +90,9 @@ const int   HALF_CYCLES_PER_SECOND = 100; // 50 Hz -> 100 półokresów
 const int   N_HALF = WINDOW_SECONDS * HALF_CYCLES_PER_SECOND;
 
 // Logika AUTO
-const float EXPORT_RESERVE_W = 100.0f;  // zawsze zachowaj min. 100 W eksportu
-const float STEP_W           = 100.0f;  // wielkość schodka
-const unsigned long INC_COOLDOWN_MS = 1000; // min. odstęp czasu między kolejnymi +100 W
+const float EXPORT_RESERVE_W = 300.0f;  // zawsze zachowaj min. 100 W eksportu
+const float STEP_W           = 400.0f;  // wielkość schodka
+const unsigned long INC_COOLDOWN_MS = 5000; // min. odstęp czasu między kolejnymi +100 W
 
 // Filtr dla wzrostu (łagodne dochodzenie); spadek robimy natychmiast
 const float TAU_UP = 5.0f; // sek
