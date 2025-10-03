@@ -1,11 +1,15 @@
 /*
   ESP32 + DTSU666 (RS485/Modbus RTU) -> WWW: import/eksport + SSR burst-fire + AUTO/MANUAL + wykres 60 s
-  Uspokojona logika schodkowa + edycja parametrów z WWW:
-    - Rezerwa eksportu: 150 W (stała)
-    - Deadband (±W)    -> edytowalne z UI (domyślnie 150 W)
-    - Krok schodka     -> edytowalne z UI (domyślnie 250 W)
-    - Cooldown: +3 s, -1.5 s, min hold 3 s
-    - EMA na eksporcie do decyzji, EMA w górę na P_applied
+  LOGIKA SCHODKOWA (z uspokojeniem):
+    - Rezerwa eksportu: min 150 W (EXPORT_RESERVE_W)
+    - Deadband: ±150 W wokół rezerwy (DEADBAND_W)
+    - Krok: 250 W (STEP_W)
+    - AUTO:
+        * eksport < (rezerwa - deadband)  -> -250 W (nie częściej niż co DEC_COOLDOWN_MS)
+        * eksport > (rezerwa + deadband)  -> +250 W (nie częściej niż co INC_COOLDOWN_MS)
+        * w strefie martwej               -> bez zmian (pamięć stanu)
+    - EMA na eksporcie (tylko do decyzji schodka); P_applied: EMA tylko w górę, w dół natychmiast
+    - Minimalny czas podtrzymania poziomu po każdej zmianie (MIN_HOLD_MS)
 
   Sieć:    TP-Link_E6D1 / 80246459
   IP:      192.168.255.50 (statyczne)
@@ -81,18 +85,12 @@ const int   HALF_CYCLES_PER_SECOND = 100; // 50 Hz -> 100 półokresów
 const int   N_HALF = WINDOW_SECONDS * HALF_CYCLES_PER_SECOND;
 
 // Logika AUTO (uspokojona)
-const float EXPORT_RESERVE_W        = 150.0f;   // rezerwa eksportu (stała)
-float       STEP_W                  = 250.0f;   // edytowalne z UI
-float       DEADBAND_W              = 150.0f;   // edytowalne z UI
-const unsigned long INC_COOLDOWN_MS = 3000;     // min odstęp między kolejnymi +krok
-const unsigned long DEC_COOLDOWN_MS = 1500;     // min odstęp między kolejnymi -krok
+const float EXPORT_RESERVE_W        = 150.0f;   // rezerwa eksportu
+const float STEP_W                  = 250.0f;   // wielkość schodka
+const float DEADBAND_W              = 150.0f;   // strefa martwa ±150 W
+const unsigned long INC_COOLDOWN_MS = 3000;     // min odstęp między kolejnymi +250 W
+const unsigned long DEC_COOLDOWN_MS = 1500;     // min odstęp między kolejnymi -250 W
 const unsigned long MIN_HOLD_MS     = 3000;     // minimalny czas podtrzymania poziomu po każdej zmianie
-
-// Granice walidacji dla UI
-const float STEP_W_MIN      = 50.0f;
-const float STEP_W_MAX      = 4000.0f;
-const float DEADBAND_MIN_W  = 0.0f;
-const float DEADBAND_MAX_W  = 1000.0f;
 
 // Filtr na decyzji (EMA na eksporcie)
 const float TAU_EXPORT_DECISIONS = 2.0f;        // sek
@@ -148,7 +146,7 @@ void pollMeter(){
 void updateStepFromExport(){
   if (!autoMode) return;
 
-  const float exportW = exportW_filt; // przefiltrowany eksport
+  const float exportW = exportW_filt; // używamy przefiltrowanego eksportu
   const unsigned long now = millis();
 
   const float lowThresh  = EXPORT_RESERVE_W - DEADBAND_W;
@@ -254,10 +252,6 @@ h1{margin:0 0 10px}
 .canvasWrap{height:220px}
 canvas{width:100%;height:100%}
 small{opacity:.6}
-label small{opacity:.7;margin-left:4px}
-input[type=number]{width:110px;padding:6px 8px;border:1px solid var(--b);border-radius:10px}
-button{padding:8px 12px;border:1px solid var(--b);border-radius:10px;background:#fff;cursor:pointer}
-button:active{transform:translateY(1px)}
 </style>
 
 <h1>Bilans, nadwyżka i grzałka</h1>
@@ -266,26 +260,12 @@ button:active{transform:translateY(1px)}
   <label><input type="checkbox" id="auto"> <b>Automatycznie</b></label>
   <input type="range" id="pct" min="0" max="100" step="1">
   <b id="pctVal" class="mono">0%</b>
-
   <span class="badge">Tryb: <span id="modeLabel">MANUAL</span></span>
   <span class="badge">Rezerwa: <span class="mono">150 W</span></span>
-  <span class="badge">Deadband: <span class="mono" id="badgeDeadband">±— W</span></span>
-  <span class="badge">Krok AUTO: <span class="mono" id="badgeStep">— W</span></span>
+  <span class="badge">Deadband: <span class="mono">±150 W</span></span>
+  <span class="badge">Krok AUTO: <span class="mono">250 W</span></span>
   <span class="badge">Zadana: <span class="mono" id="targetW">0 W</span></span>
   <span class="badge">Przyłożona: <span class="mono" id="appliedW">0 W</span></span>
-</div>
-
-<div class="card ctrl">
-  <label>Deadband (±W)
-    <small>0–1000</small>
-    <input type="number" id="deadbandW" min="0" max="1000" step="10">
-  </label>
-  <label>Krok schodka (W)
-    <small>50–4000</small>
-    <input type="number" id="stepW" min="50" max="4000" step="50">
-  </label>
-  <button id="apply">Zastosuj</button>
-  <small id="applyInfo"></small>
 </div>
 
 <div class="grid">
@@ -330,8 +310,7 @@ function drawSeries(canvas, data, maxY, color){
 
 let state = {
   auto:true, manual_pct:0, P_target:0, P_applied:0,
-  grid_import_W:0, export_W:0, heater_W:0,
-  step_w:250, deadband_w:150
+  grid_import_W:0, export_W:0, heater_W:0
 };
 let histHeater = new Array(60).fill(0);
 let histImport = new Array(60).fill(0);
@@ -349,12 +328,6 @@ function applyUI(){
   byId('imp').textContent     = fmt(state.grid_import_W,1)+' W';
   byId('exp').textContent     = fmt(state.export_W,1)+' W';
   byId('heater').textContent  = fmt(state.heater_W,1)+' W';
-
-  byId('deadbandW').value = Math.round(state.deadband_w);
-  byId('stepW').value     = Math.round(state.step_w);
-
-  byId('badgeDeadband').textContent = '±' + Math.round(state.deadband_w) + ' W';
-  byId('badgeStep').textContent     = Math.round(state.step_w) + ' W';
 }
 
 function drawAll(){
@@ -370,13 +343,10 @@ async function fetchAll(){
   state.grid_import_W = d.grid_import_W;
   state.export_W      = d.export_W;
   state.heater_W      = d.heater_W;
-
   state.auto        = c.auto;
   state.manual_pct  = c.manual_pct;
   state.P_target    = c.P_target;
   state.P_applied   = c.P_applied;
-  state.step_w      = c.step_w;
-  state.deadband_w  = c.deadband_w;
 
   histHeater.push(state.heater_W); if(histHeater.length>60) histHeater.shift();
   histImport.push(state.grid_import_W); if(histImport.length>60) histImport.shift();
@@ -407,20 +377,6 @@ document.addEventListener('DOMContentLoaded', ()=>{
     fetchAll().catch(()=>{});
   });
 
-  byId('apply').addEventListener('click', async ()=>{
-    const deadband = byId('deadbandW').value;
-    const step     = byId('stepW').value;
-    byId('applyInfo').textContent = 'Zapisywanie...';
-    try{
-      await setCtrl({deadband_w:deadband, step_w:step});
-      byId('applyInfo').textContent = 'Zapisano.';
-      fetchAll().catch(()=>{});
-    }catch(e){
-      byId('applyInfo').textContent = 'Błąd zapisu.';
-    }
-    setTimeout(()=>{ byId('applyInfo').textContent=''; }, 1500);
-  });
-
   fetchAll().catch(()=>{});
   setInterval(()=>fetchAll().catch(()=>{}), 1000);
 });
@@ -444,25 +400,23 @@ void handleData(){
   server.send(200,"application/json; charset=utf-8", buf);
 }
 
-// Stan kontrolera (dla UI) — teraz również zwracamy step_w i deadband_w
+// Stan kontrolera (dla UI)
 void handleCtrlJSON(){
   float P_target = computeTargetPower();
   float manual_pct = manualDuty * 100.0f;
-  char buf[512];
+  char buf[400];
   snprintf(buf, sizeof(buf),
     "{\"auto\":%s,\"manual_pct\":%.1f,"
     "\"P_target\":%.1f,\"P_applied\":%.1f,"
-    "\"on_cycles\":%d,\"window_halfcycles\":%d,"
-    "\"step_w\":%.1f,\"deadband_w\":%.1f}",
+    "\"on_cycles\":%d,\"window_halfcycles\":%d}",
     autoMode?"true":"false", manual_pct,
     P_target, P_applied,
-    on_cycles, N_HALF,
-    STEP_W, DEADBAND_W
+    on_cycles, N_HALF
   );
   server.send(200, "application/json; charset=utf-8", buf);
 }
 
-// Ustawienia z UI (tryb, duty, step_w, deadband_w)
+// Ustawienia z UI
 void handleSet(){
   if (server.hasArg("mode")){
     String m = server.arg("mode");
@@ -473,23 +427,6 @@ void handleSet(){
     int pct = server.arg("duty").toInt();
     if (pct < 0) pct = 0; if (pct > 100) pct = 100;
     manualDuty = pct / 100.0f;
-  }
-  if (server.hasArg("step_w")){
-    float v = server.arg("step_w").toFloat();
-    if (isnan(v)) v = STEP_W;
-    if (v < STEP_W_MIN) v = STEP_W_MIN;
-    if (v > STEP_W_MAX) v = STEP_W_MAX;
-    STEP_W = v;
-    // opcjonalnie „przyciąć” P_step do nowego kroku: brak wymagania — zostawiamy jak jest
-    lastChangeMs = 0; // pozwól od razu zadziałać logice przy nowym parametrze
-  }
-  if (server.hasArg("deadband_w")){
-    float v = server.arg("deadband_w").toFloat();
-    if (isnan(v)) v = DEADBAND_W;
-    if (v < DEADBAND_MIN_W) v = DEADBAND_MIN_W;
-    if (v > DEADBAND_MAX_W) v = DEADBAND_MAX_W;
-    DEADBAND_W = v;
-    lastChangeMs = 0;
   }
   handleCtrlJSON();
 }
@@ -527,7 +464,7 @@ void setup(){
 
   // Start
   pollMeter();              // wstępny odczyt + inicjalizacja filtru eksportu
-  updateStepFromExport();   // inicjalizuj stan schodka
+  updateStepFromExport();   // inicjalizuj stan schodka na podstawie pierwszego pomiaru
   updateControlWindow();
 }
 
@@ -538,7 +475,7 @@ void loop(){
   if (millis() - lastPoll > 1000) {
     lastPoll = millis();
     pollMeter();
-    updateStepFromExport(); // +krok / -krok / bez zmian (z histerezą i cooldownami)
+    updateStepFromExport(); // decyzja: +250 / -250 / bez zmiany (z histerezą i cooldownami)
   }
 
   // Sterowanie burst-fire (10 ms)
