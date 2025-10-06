@@ -1,12 +1,14 @@
 /*
   ESP32 + DTSU666 (RS485/Modbus RTU) -> WWW: import/eksport + SSR burst-fire + AUTO/MANUAL + wykres 60 s
-  LOGIKA SCHODKOWA (z pamięcią stanu):
+  STABILNA LOGIKA Z UŚREDNIANIEM:
+    - Średnia krocząca z ostatnich 10 sekund pomiarów
+    - Decyzje podejmowane co 10 sekund (nie co 1 s)
     - Rezerwa eksportu: min 100 W (EXPORT_RESERVE_W)
     - AUTO:
-        * eksport < 100 W  -> natychmiast -100 W
-        * eksport ≥ 200 W  -> +100 W (max 1 raz / ~1 s)
-        * 100..199 W       -> bez zmian
-    - EMA tylko przy wzroście mocy; przy spadku natychmiastowa zmiana
+        * eksport < 50 W   -> łagodnie -50 W
+        * eksport ≥ 250 W  -> łagodnie +50 W
+        * 50..249 W        -> bez zmian (szeroka histereza)
+    - Płynne przejścia z filtrem EMA
 
   Sieć:    TP-Link_E6D1 / 80246459
   IP:      192.168.255.50 (statyczne)
@@ -49,7 +51,7 @@ bool readFloat32_raw(uint16_t reg, float& outVal) {
     if (r == node.ku8MBSuccess){
       uint16_t hi = node.getResponseBuffer(0);
       uint16_t lo = node.getResponseBuffer(1);
-      uint32_t raw = ((uint32_t)hi << 16) | lo; // przy dziwnych wynikach spróbuj (lo<<16)|hi
+      uint32_t raw = ((uint32_t)hi << 16) | lo;
       memcpy(&outVal, &raw, sizeof(float));
       return true;
     }
@@ -69,19 +71,46 @@ struct {
   unsigned long lastOkMs=0;
 } md;
 
+// Bufor do uśredniania (10 ostatnich pomiarów)
+const int AVG_BUFFER_SIZE = 10;
+float exportBuffer[AVG_BUFFER_SIZE];
+int bufferIndex = 0;
+bool bufferFull = false;
+
 unsigned long lastPoll = 0;
+unsigned long lastDecision = 0;
 
 void pollMeter(){
   float v;
-  if (readFloat32_scaled(0x2012, 10.0f, v)) { // Total active power /10 => W
+  if (readFloat32_scaled(0x2012, 10.0f, v)) {
     md.Pt = v;
     md.lastOkMs = millis();
+    
+    // Dodaj do bufora eksportu
+    float currentExport = (v < 0.0f) ? -v : 0.0f;
+    exportBuffer[bufferIndex] = currentExport;
+    bufferIndex = (bufferIndex + 1) % AVG_BUFFER_SIZE;
+    if (bufferIndex == 0) bufferFull = true;
   }
+}
+
+// Oblicz średnią z bufora
+float getAverageExport(){
+  if (!bufferFull && bufferIndex == 0) return 0.0f;
+  
+  float sum = 0.0f;
+  int count = bufferFull ? AVG_BUFFER_SIZE : bufferIndex;
+  
+  for(int i = 0; i < count; i++){
+    sum += exportBuffer[i];
+  }
+  
+  return count > 0 ? sum / count : 0.0f;
 }
 
 //////////////////// SSR / Sterowanie //////////////////
 // Sprzęt
-const int SSR_PIN = 13;                 // D13 -> SSR IN+; SSR IN- -> GND
+const int SSR_PIN = 13;
 
 // Parametry główne
 const float P_MAX = 2000.0f;            // maks. moc grzałki (W)
@@ -89,25 +118,27 @@ const int   WINDOW_SECONDS = 1;         // okno 1 s
 const int   HALF_CYCLES_PER_SECOND = 100; // 50 Hz -> 100 półokresów
 const int   N_HALF = WINDOW_SECONDS * HALF_CYCLES_PER_SECOND;
 
-// Logika AUTO
-const float EXPORT_RESERVE_W = 300.0f;  // zawsze zachowaj min. 100 W eksportu
-const float STEP_W           = 400.0f;  // wielkość schodka
-const unsigned long INC_COOLDOWN_MS = 5000; // min. odstęp czasu między kolejnymi +100 W
+// Logika AUTO - złagodzona
+const float EXPORT_RESERVE_W = 100.0f;  // zawsze zachowaj min. 100 W eksportu
+const float STEP_W           = 50.0f;   // mniejszy krok dla stabilności (było 100)
+const float EXPORT_LOW       = 50.0f;   // próg dolny (poniżej = zmniejsz moc)
+const float EXPORT_HIGH      = 250.0f;  // próg górny (powyżej = zwiększ moc)
+const unsigned long DECISION_INTERVAL_MS = 10000; // decyzje co 10 sekund
 
-// Filtr dla wzrostu (łagodne dochodzenie); spadek robimy natychmiast
-const float TAU_UP = 5.0f; // sek
+// Filtry dla płynnych zmian
+const float TAU_UP   = 8.0f;  // wolniejsze dochodzenie (było 5)
+const float TAU_DOWN = 5.0f;  // wolniejsze schodzenie
 
 // Tryb i wartości
-bool  autoMode = true;     // AUTO: z exportu; MANUAL: z suwaka
-float manualDuty = 0.0f;   // 0..1 (tylko MANUAL)
+bool  autoMode = true;
+float manualDuty = 0.0f;
 
 // Stan sterowania
-float P_step    = 0.0f;    // docelowa moc schodkowa (0..P_MAX), pamięć stanu
-float P_applied = 0.0f;    // faktycznie przykładana (po filtrze wzrostowym)
+float P_step    = 0.0f;    // docelowa moc schodkowa
+float P_applied = 0.0f;    // faktycznie przykładana
 int   on_cycles = 0;
 int   phaseIndex = 0;
 unsigned long lastHalfMillis = 0;
-unsigned long lastIncMs = 0;
 
 void setupSSR(){
   pinMode(SSR_PIN, OUTPUT);
@@ -116,40 +147,53 @@ void setupSSR(){
   lastHalfMillis = millis();
   P_applied = 0.0f;
   P_step = 0.0f;
+  
+  // Inicjalizacja bufora
+  for(int i = 0; i < AVG_BUFFER_SIZE; i++){
+    exportBuffer[i] = 0.0f;
+  }
 }
 
 void updateStepFromExport(){
   if (!autoMode) return;
-
-  const float exportW = (md.Pt < 0.0f) ? -md.Pt : 0.0f;
-
-  // 1) poniżej rezerwy -> natychmiast -100 W
-  if (exportW < EXPORT_RESERVE_W - 0.5f) { // mała histereza pomiarowa
-    if (P_step >= STEP_W) P_step -= STEP_W;
-    else P_step = 0.0f;
-    return; // odejmujemy od razu i kończymy (kolejne odjęcia oceni następny pomiar)
-  }
-
-  // 2) powyżej progu +100 W nad rezerwą -> +100 W, ale nie częściej niż co 1 s
-  if (exportW >= EXPORT_RESERVE_W + STEP_W - 0.5f) {
-    unsigned long now = millis();
-    if (now - lastIncMs >= INC_COOLDOWN_MS) {
-      P_step += STEP_W;
-      if (P_step > P_MAX) P_step = P_MAX;
-      lastIncMs = now;
+  
+  // Decyzje tylko co 10 sekund
+  unsigned long now = millis();
+  if (now - lastDecision < DECISION_INTERVAL_MS) return;
+  lastDecision = now;
+  
+  // Używaj średniej z ostatnich 10 pomiarów
+  float avgExport = getAverageExport();
+  
+  // Logika z histerezą
+  if (avgExport < EXPORT_LOW) {
+    // Za mało eksportu - zmniejsz moc
+    if (P_step >= STEP_W) {
+      P_step -= STEP_W;
+      Serial.printf("Zmniejszam moc o %.0f W (śr. eksport: %.1f W)\n", STEP_W, avgExport);
+    } else {
+      P_step = 0.0f;
     }
   }
-  // 3) w paśmie 100..199 W -> bez zmian (trzymamy pamięć stanu)
+  else if (avgExport >= EXPORT_HIGH) {
+    // Dużo eksportu - zwiększ moc
+    float newStep = P_step + STEP_W;
+    if (newStep <= P_MAX) {
+      P_step = newStep;
+      Serial.printf("Zwiększam moc o %.0f W (śr. eksport: %.1f W)\n", STEP_W, avgExport);
+    } else {
+      P_step = P_MAX;
+    }
+  }
+  // Pasmo 50-249 W -> bez zmian (szeroka histereza dla stabilności)
 }
 
 float computeTargetPower(){
   if (autoMode) {
-    // AUTO: korzystamy z pamięci stanu (P_step)
     if (P_step < 0) P_step = 0;
     if (P_step > P_MAX) P_step = P_MAX;
     return P_step;
   } else {
-    // MANUAL: suwak 0..100%
     float P_target = constrain(manualDuty, 0.0f, 1.0f) * P_MAX;
     return P_target;
   }
@@ -157,39 +201,43 @@ float computeTargetPower(){
 
 void updateControlWindow(){
   float P_target = computeTargetPower();
-
-  // Spadek -> natychmiastowe zejście (brak EMA w dół)
+  
+  // Płynne przejścia w obie strony
+  float k;
   if (P_target < P_applied) {
-    P_applied = P_target;
+    // Spadek - wolniejszy niż wcześniej
+    k = (float)WINDOW_SECONDS / (TAU_DOWN + (float)WINDOW_SECONDS);
   } else {
-    // Wzrost -> łagodne dochodzenie (EMA)
-    float k = (float)WINDOW_SECONDS / (TAU_UP + (float)WINDOW_SECONDS);
-    if (k < 0.0f) k = 0.0f; if (k > 1.0f) k = 1.0f;
-    P_applied = P_applied + k * (P_target - P_applied);
+    // Wzrost - łagodne dochodzenie
+    k = (float)WINDOW_SECONDS / (TAU_UP + (float)WINDOW_SECONDS);
   }
-
+  
+  if (k < 0.0f) k = 0.0f; 
+  if (k > 1.0f) k = 1.0f;
+  P_applied = P_applied + k * (P_target - P_applied);
+  
   // Ograniczenia
   if (P_applied < 0.0f) P_applied = 0.0f;
   if (P_applied > P_MAX) P_applied = P_MAX;
-
+  
   // Duty -> ilość półokresów w oknie
-  float duty = P_applied / P_MAX;              // 0..1
-  on_cycles = (int)round(duty * N_HALF);       // 0..N_HALF
+  float duty = P_applied / P_MAX;
+  on_cycles = (int)round(duty * N_HALF);
   if (on_cycles < 0) on_cycles = 0;
   if (on_cycles > N_HALF) on_cycles = N_HALF;
 }
 
 void halfCycleTick(){
-  const unsigned long HALF_MS = 10; // ~10 ms
+  const unsigned long HALF_MS = 10;
   unsigned long now = millis();
   if (now - lastHalfMillis >= HALF_MS){
     lastHalfMillis += HALF_MS;
-
+    
     if (phaseIndex == 0) updateControlWindow();
-
+    
     if (phaseIndex < on_cycles) digitalWrite(SSR_PIN, HIGH);
     else                        digitalWrite(SSR_PIN, LOW);
-
+    
     phaseIndex++;
     if (phaseIndex >= N_HALF) phaseIndex = 0;
   }
@@ -200,7 +248,7 @@ String htmlPage(){
   String s = R"HTML(
 <!doctype html><html lang="pl"><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Bilans, nadwyżka i grzałka (60 s)</title>
+<title>Stabilne sterowanie grzałką (60 s)</title>
 <style>
 :root{ --ok:#0ea37a; --bad:#d64545; --b:#e5e7eb; }
 *{box-sizing:border-box}
@@ -211,30 +259,38 @@ h1{margin:0 0 10px}
 .kv{display:flex;justify-content:space-between;align-items:baseline}
 .mono{font-variant-numeric:tabular-nums}
 .ctrl{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
-.badge{padding:4px 8px;border:1px solid var(--b);border-radius:999px}
+.badge{padding:4px 8px;border:1px solid var(--b);border-radius:999px;font-size:0.9em}
+.badge-info{background:#e0f2fe;border-color:#0284c7}
 #pct{width:220px}
 .canvasWrap{height:220px}
 canvas{width:100%;height:100%}
 small{opacity:.6}
+.status{margin-top:12px;padding:8px;background:#f0f9ff;border-radius:8px;font-size:0.9em}
 </style>
 
-<h1>Bilans, nadwyżka i grzałka</h1>
+<h1>Stabilne sterowanie grzałką</h1>
 
 <div class="card ctrl">
   <label><input type="checkbox" id="auto"> <b>Automatycznie</b></label>
   <input type="range" id="pct" min="0" max="100" step="1">
   <b id="pctVal" class="mono">0%</b>
   <span class="badge">Tryb: <span id="modeLabel">MANUAL</span></span>
-  <span class="badge">Rezerwa: <span class="mono">100 W</span></span>
-  <span class="badge">Krok AUTO: <span class="mono">100 W</span></span>
-  <span class="badge">Zadana: <span class="mono" id="targetW">0 W</span></span>
-  <span class="badge">Przyłożona: <span class="mono" id="appliedW">0 W</span></span>
+</div>
+
+<div class="card status">
+  <b>Parametry stabilizacji:</b>
+  <span class="badge badge-info">Uśrednianie: 10 s</span>
+  <span class="badge badge-info">Decyzje co: 10 s</span>
+  <span class="badge badge-info">Krok: ±50 W</span>
+  <span class="badge badge-info">Histereza: 50-250 W</span>
+  <span class="badge badge-info">Śr. eksport: <span class="mono" id="avgExp">– W</span></span>
 </div>
 
 <div class="grid">
   <div class="card"><div class="kv"><b>Pobór z sieci</b><span class="mono" id="imp">– W</span></div></div>
   <div class="card"><div class="kv"><b>Nadwyżka (eksport)</b><span class="mono" id="exp">– W</span></div></div>
   <div class="card"><div class="kv"><b>Moc grzałki</b><span class="mono" id="heater">– W</span></div></div>
+  <div class="card"><div class="kv"><b>Moc zadana</b><span class="mono" id="targetW">– W</span></div></div>
 </div>
 
 <div class="grid" style="margin-top:12px">
@@ -243,8 +299,8 @@ small{opacity:.6}
     <div class="canvasWrap"><canvas id="cHeater" width="600" height="220"></canvas></div>
   </div>
   <div class="card">
-    <div class="kv"><b>Wykres: pobór z sieci (60 s)</b><small>odświeżanie co 1 s</small></div>
-    <div class="canvasWrap"><canvas id="cImport" width="600" height="220"></canvas></div>
+    <div class="kv"><b>Wykres: eksport (60 s)</b><small>odświeżanie co 1 s</small></div>
+    <div class="canvasWrap"><canvas id="cExport" width="600" height="220"></canvas></div>
   </div>
 </div>
 
@@ -252,31 +308,56 @@ small{opacity:.6}
 function fmt(v,d=1){return Number(v).toFixed(d)}
 
 // wykres bez bibliotek
-function drawSeries(canvas, data, maxY, color){
+function drawSeries(canvas, data, maxY, color, targetLine=null){
   const ctx = canvas.getContext('2d');
   const W = canvas.width, H = canvas.height;
   ctx.clearRect(0,0,W,H);
+  
+  // Siatka
   ctx.strokeStyle='#e5e7eb'; ctx.lineWidth=1;
-  for(let i=0;i<=4;i++){ const y=i*(H/4); ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(W,y); ctx.stroke(); }
-  ctx.strokeStyle='#ccc'; ctx.beginPath(); ctx.moveTo(0,H-0.5); ctx.lineTo(W,H-0.5); ctx.stroke();
+  for(let i=0;i<=4;i++){ 
+    const y=i*(H/4); 
+    ctx.beginPath(); 
+    ctx.moveTo(0,y); 
+    ctx.lineTo(W,y); 
+    ctx.stroke(); 
+  }
+  
+  // Linia docelowa (opcjonalna)
+  if(targetLine !== null && maxY > 0){
+    ctx.strokeStyle='#fbbf24'; 
+    ctx.lineWidth=1;
+    ctx.setLineDash([5,5]);
+    const ty = H - (targetLine/maxY)*H;
+    ctx.beginPath();
+    ctx.moveTo(0,ty);
+    ctx.lineTo(W,ty);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+  
+  // Dane
   if(data.length<2) return;
-  ctx.strokeStyle=color; ctx.lineWidth=2; ctx.beginPath();
+  ctx.strokeStyle=color; 
+  ctx.lineWidth=2; 
+  ctx.beginPath();
   const n=data.length;
   for(let i=0;i<n;i++){
     const x = (i/(60-1))*W;
     const v = Math.max(0, data[i]);
     const y = H - (maxY>0 ? (v/maxY)*H : 0);
-    if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+    if(i===0) ctx.moveTo(x,y); 
+    else ctx.lineTo(x,y);
   }
   ctx.stroke();
 }
 
 let state = {
   auto:true, manual_pct:0, P_target:0, P_applied:0,
-  grid_import_W:0, export_W:0, heater_W:0
+  grid_import_W:0, export_W:0, heater_W:0, avg_export_W:0
 };
 let histHeater = new Array(60).fill(0);
-let histImport = new Array(60).fill(0);
+let histExport = new Array(60).fill(0);
 
 function byId(id){ return document.getElementById(id); }
 function applyUI(){
@@ -286,16 +367,16 @@ function applyUI(){
   byId('pct').value = pctVal;
   byId('pctVal').textContent = pctVal + '%';
   byId('modeLabel').textContent = state.auto ? 'AUTO' : 'MANUAL';
-  byId('targetW').textContent = Math.round(state.P_target)+' W';
-  byId('appliedW').textContent = Math.round(state.P_applied)+' W';
-  byId('imp').textContent     = fmt(state.grid_import_W,1)+' W';
-  byId('exp').textContent     = fmt(state.export_W,1)+' W';
-  byId('heater').textContent  = fmt(state.heater_W,1)+' W';
+  byId('targetW').textContent  = Math.round(state.P_target)+' W';
+  byId('imp').textContent      = fmt(state.grid_import_W,1)+' W';
+  byId('exp').textContent      = fmt(state.export_W,1)+' W';
+  byId('heater').textContent   = fmt(state.heater_W,1)+' W';
+  byId('avgExp').textContent   = fmt(state.avg_export_W,1)+' W';
 }
 
 function drawAll(){
-  drawSeries(byId('cHeater'), histHeater, 2000, '#0ea37a');
-  drawSeries(byId('cImport'), histImport, 3000, '#d64545');
+  drawSeries(byId('cHeater'), histHeater, 2000, '#0ea37a', state.P_target);
+  drawSeries(byId('cExport'), histExport, 500, '#3b82f6', 100); // 100W = rezerwa
 }
 
 async function fetchAll(){
@@ -306,14 +387,17 @@ async function fetchAll(){
   state.grid_import_W = d.grid_import_W;
   state.export_W      = d.export_W;
   state.heater_W      = d.heater_W;
-  state.auto        = c.auto;
-  state.manual_pct  = c.manual_pct;
-  state.P_target    = c.P_target;
-  state.P_applied   = c.P_applied;
-
-  histHeater.push(state.heater_W); if(histHeater.length>60) histHeater.shift();
-  histImport.push(state.grid_import_W); if(histImport.length>60) histImport.shift();
-
+  state.avg_export_W  = d.avg_export_W || state.export_W;
+  state.auto          = c.auto;
+  state.manual_pct    = c.manual_pct;
+  state.P_target      = c.P_target;
+  state.P_applied     = c.P_applied;
+  
+  histHeater.push(state.heater_W); 
+  if(histHeater.length>60) histHeater.shift();
+  histExport.push(state.export_W); 
+  if(histExport.length>60) histExport.shift();
+  
   applyUI();
   drawAll();
 }
@@ -339,7 +423,7 @@ document.addEventListener('DOMContentLoaded', ()=>{
     await setCtrl({duty:pct});
     fetchAll().catch(()=>{});
   });
-
+  
   fetchAll().catch(()=>{});
   setInterval(()=>fetchAll().catch(()=>{}), 1000);
 });
@@ -355,10 +439,12 @@ void handleRoot(){ server.send(200,"text/html; charset=utf-8", htmlPage()); }
 void handleData(){
   float grid_import_W = md.Pt > 0 ? md.Pt : 0.0f;
   float export_W      = md.Pt < 0 ? -md.Pt : 0.0f;
-  char buf[256];
+  float avg_export_W  = getAverageExport();
+  
+  char buf[300];
   snprintf(buf, sizeof(buf),
-    "{\"grid_import_W\":%.1f,\"export_W\":%.1f,\"heater_W\":%.1f}",
-    grid_import_W, export_W, P_applied
+    "{\"grid_import_W\":%.1f,\"export_W\":%.1f,\"heater_W\":%.1f,\"avg_export_W\":%.1f}",
+    grid_import_W, export_W, P_applied, avg_export_W
   );
   server.send(200,"application/json; charset=utf-8", buf);
 }
@@ -388,7 +474,8 @@ void handleSet(){
   }
   if (server.hasArg("duty")){
     int pct = server.arg("duty").toInt();
-    if (pct < 0) pct = 0; if (pct > 100) pct = 100;
+    if (pct < 0) pct = 0; 
+    if (pct > 100) pct = 100;
     manualDuty = pct / 100.0f;
   }
   handleCtrlJSON();
@@ -398,49 +485,58 @@ void handleSet(){
 void setup(){
   Serial.begin(115200);
   delay(200);
-
+  
   pinMode(RS485_DE_RE, OUTPUT);
   digitalWrite(RS485_DE_RE, LOW);
-
+  
   RS485.begin(UART_BAUD, SERIAL_MODE, 16, 17);
   RS485.setTimeout(500);
   node.begin(METER_ID, RS485);
   node.preTransmission(preTransmission);
   node.postTransmission(postTransmission);
-
+  
   // Wi-Fi
   WiFi.mode(WIFI_STA);
   WiFi.config(local_IP, gateway, subnet, dns1, dns2);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   unsigned long t0 = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) delay(200);
-
+  
+  Serial.println("\n=== STABILNE STEROWANIE GRZAŁKĄ ===");
+  Serial.print("IP: ");
+  Serial.println(WiFi.localIP());
+  Serial.println("Parametry:");
+  Serial.println("- Uśrednianie: 10 ostatnich pomiarów");
+  Serial.println("- Decyzje co: 10 sekund");
+  Serial.println("- Krok mocy: ±50 W");
+  Serial.println("- Histereza: 50-250 W eksportu");
+  
   // HTTP
   server.on("/", handleRoot);
   server.on("/data.json", handleData);
   server.on("/ctrl.json", handleCtrlJSON);
   server.on("/set", handleSet);
   server.begin();
-
+  
   // SSR
   setupSSR();
-
+  
   // Start
   pollMeter();
-  updateStepFromExport();   // inicjalizuj stan schodka na podstawie pierwszego pomiaru
+  updateStepFromExport();
   updateControlWindow();
 }
 
 void loop(){
   server.handleClient();
-
-  // Odczyt i aktualizacja stanu co 1 s
+  
+  // Odczyt co 1 s (do bufora uśredniania)
   if (millis() - lastPoll > 1000) {
     lastPoll = millis();
     pollMeter();
-    updateStepFromExport(); // decyzja: +100 / -100 / bez zmiany
+    updateStepFromExport(); // sprawdza czy minęło 10s od ostatniej decyzji
   }
-
+  
   // Sterowanie burst-fire (10 ms)
   halfCycleTick();
 }
