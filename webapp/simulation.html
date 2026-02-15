@@ -1,0 +1,647 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Symulacja sterowania grzałką - stary vs nowy algorytm</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: system-ui, -apple-system, sans-serif; background: #0f172a; color: #e2e8f0; padding: 20px; }
+h1 { text-align: center; margin-bottom: 8px; font-size: 1.4em; }
+.subtitle { text-align: center; color: #94a3b8; margin-bottom: 20px; font-size: 0.9em; }
+
+.controls {
+  display: flex; gap: 12px; justify-content: center; flex-wrap: wrap;
+  margin-bottom: 20px; padding: 16px; background: #1e293b; border-radius: 12px;
+}
+.control-group { display: flex; flex-direction: column; align-items: center; gap: 4px; }
+.control-group label { font-size: 0.8em; color: #94a3b8; }
+.control-group input[type=range] { width: 140px; }
+.control-group .value { font-size: 0.9em; font-weight: bold; color: #38bdf8; }
+button {
+  padding: 10px 24px; border: none; border-radius: 8px; cursor: pointer;
+  font-size: 1em; font-weight: bold; transition: all 0.2s;
+}
+.btn-start { background: #22c55e; color: #000; }
+.btn-start:hover { background: #16a34a; }
+.btn-reset { background: #ef4444; color: #fff; }
+.btn-reset:hover { background: #dc2626; }
+.btn-speed { background: #3b82f6; color: #fff; }
+.btn-speed:hover { background: #2563eb; }
+
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px; }
+@media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+
+.panel {
+  background: #1e293b; border-radius: 12px; padding: 16px;
+  border: 1px solid #334155;
+}
+.panel h2 { font-size: 1.1em; margin-bottom: 4px; }
+.panel .desc { font-size: 0.8em; color: #94a3b8; margin-bottom: 12px; }
+.panel.old { border-color: #ef4444; }
+.panel.old h2 { color: #f87171; }
+.panel.new { border-color: #22c55e; }
+.panel.new h2 { color: #4ade80; }
+
+canvas { width: 100%; height: 200px; background: #0f172a; border-radius: 8px; }
+
+.stats {
+  display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px;
+  margin-top: 12px; font-size: 0.85em;
+}
+.stat { text-align: center; padding: 8px; background: #0f172a; border-radius: 8px; }
+.stat .label { color: #94a3b8; font-size: 0.8em; }
+.stat .val { font-weight: bold; font-size: 1.1em; }
+
+.solar-panel {
+  background: #1e293b; border-radius: 12px; padding: 16px;
+  border: 1px solid #334155; margin-bottom: 16px;
+}
+.solar-panel h2 { font-size: 1.1em; margin-bottom: 12px; color: #fbbf24; }
+canvas.solar-canvas { height: 120px; }
+
+.legend { display: flex; gap: 16px; justify-content: center; margin-top: 8px; font-size: 0.8em; }
+.legend-item { display: flex; align-items: center; gap: 4px; }
+.legend-dot { width: 12px; height: 12px; border-radius: 50%; }
+
+.explanation {
+  background: #1e293b; border-radius: 12px; padding: 20px;
+  border: 1px solid #334155; margin-top: 16px;
+}
+.explanation h2 { color: #fbbf24; margin-bottom: 12px; }
+.explanation p { color: #94a3b8; line-height: 1.6; margin-bottom: 8px; font-size: 0.9em; }
+.explanation code { background: #334155; padding: 2px 6px; border-radius: 4px; color: #38bdf8; }
+</style>
+</head>
+<body>
+
+<h1>Symulacja: Stary vs Nowy algorytm sterowania grzałką</h1>
+<p class="subtitle">Jak system reaguje na skaczący eksport i sprzężenie zwrotne (grzałka zmniejsza eksport)</p>
+
+<div class="controls">
+  <div class="control-group">
+    <label>Produkcja solarna [W]</label>
+    <input type="range" id="solarSlider" min="500" max="3000" value="1800" step="50">
+    <span class="value" id="solarVal">1800 W</span>
+  </div>
+  <div class="control-group">
+    <label>Zużycie domu [W]</label>
+    <input type="range" id="houseSlider" min="200" max="1500" value="600" step="50">
+    <span class="value" id="houseVal">600 W</span>
+  </div>
+  <div class="control-group">
+    <label>Szum odczytu [W]</label>
+    <input type="range" id="noiseSlider" min="0" max="200" value="80" step="10">
+    <span class="value" id="noiseVal">±80 W</span>
+  </div>
+  <div class="control-group">
+    <label>Skoki zużycia domu</label>
+    <input type="range" id="spikeSlider" min="0" max="500" value="200" step="50">
+    <span class="value" id="spikeVal">±200 W</span>
+  </div>
+  <div class="control-group" style="justify-content: flex-end;">
+    <button class="btn-start" id="btnStart">START</button>
+    <button class="btn-reset" id="btnReset">RESET</button>
+  </div>
+  <div class="control-group" style="justify-content: flex-end;">
+    <button class="btn-speed" id="btnSpeed">Prędkość: 1x</button>
+  </div>
+</div>
+
+<div class="solar-panel">
+  <h2>Warunki zewnętrzne (to co się dzieje "na dachu" i "w domu")</h2>
+  <canvas id="cSolar" class="solar-canvas" width="800" height="120"></canvas>
+  <div class="legend">
+    <div class="legend-item"><div class="legend-dot" style="background:#fbbf24"></div> Produkcja solarna</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#f87171"></div> Zużycie domu</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#38bdf8"></div> Nadwyżka brutto (solar - dom)</div>
+  </div>
+</div>
+
+<div class="grid">
+  <div class="panel old">
+    <h2>STARY algorytm (histereza ±50W co 10s)</h2>
+    <p class="desc">Patrzy na zmierzony eksport. Nie wie ile grzałka zjada. Krok +50W / -150W, histereza 50-250W, decyzja co 10s.</p>
+    <canvas id="cOld" width="800" height="200"></canvas>
+    <div class="legend">
+      <div class="legend-item"><div class="legend-dot" style="background:#f87171"></div> Eksport</div>
+      <div class="legend-item"><div class="legend-dot" style="background:#fb923c"></div> Grzałka</div>
+      <div class="legend-item"><div class="legend-dot" style="background:#e879f9"></div> Import z sieci</div>
+      <div class="legend-item"><div class="legend-dot" style="background:#fbbf24; opacity:0.5"></div> Rezerwa 100W</div>
+    </div>
+    <div class="stats">
+      <div class="stat"><div class="label">Moc grzałki</div><div class="val" id="oldHeater">0 W</div></div>
+      <div class="stat"><div class="label">Eksport</div><div class="val" id="oldExport">0 W</div></div>
+      <div class="stat"><div class="label">Import</div><div class="val" id="oldImport" style="color:#e879f9">0 W</div></div>
+      <div class="stat"><div class="label">Oscylacje</div><div class="val" id="oldOsc">0</div></div>
+    </div>
+  </div>
+
+  <div class="panel new">
+    <h2>NOWY algorytm (3 priorytety + brutto eksport)</h2>
+    <p class="desc">1) Import? → natychmiast tnij. 2) Eksport < 300W rezerwy? → proporcjonalnie zmniejsz. 3) Nadwyżka? → powoli zwiększ co 5s. Brutto kompensuje sprzężenie.</p>
+    <canvas id="cNew" width="800" height="200"></canvas>
+    <div class="legend">
+      <div class="legend-item"><div class="legend-dot" style="background:#4ade80"></div> Eksport</div>
+      <div class="legend-item"><div class="legend-dot" style="background:#22d3ee"></div> Grzałka</div>
+      <div class="legend-item"><div class="legend-dot" style="background:#e879f9"></div> Import z sieci</div>
+      <div class="legend-item"><div class="legend-dot" style="background:#fbbf24; opacity:0.5"></div> Rezerwa 100W</div>
+    </div>
+    <div class="stats">
+      <div class="stat"><div class="label">Moc grzałki</div><div class="val" id="newHeater">0 W</div></div>
+      <div class="stat"><div class="label">Eksport</div><div class="val" id="newExport">0 W</div></div>
+      <div class="stat"><div class="label">Import</div><div class="val" id="newImport" style="color:#e879f9">0 W</div></div>
+      <div class="stat"><div class="label">Oscylacje</div><div class="val" id="newOsc">0</div></div>
+    </div>
+  </div>
+</div>
+
+<div class="explanation">
+  <h2>Jak działa nowy algorytm? (3 priorytety)</h2>
+  <p>
+    <b>PRIORYTET 1 - Import z sieci (co 1s, BEZ filtra):</b> Jeśli licznik pokazuje import
+    → natychmiast tnij grzałkę o <code>import + rezerwa (300W)</code>. Zero czekania. Zero uśredniania.
+    To jest najważniejsza zasada: <b>NIGDY nie ciągnij z sieci</b>.
+  </p>
+  <p>
+    <b>PRIORYTET 2 - Eksport poniżej rezerwy (co 1s, szybki filtr):</b> Eksport jest, ale < 300W?
+    Zmniejsz moc proporcjonalnie do deficytu: <code>deficit = 300 - eksport</code>.
+    Szybki filtr (alpha=0.7) - reaguje w 1-2 sekundy. Im mniej eksportu, tym agresywniej tnie.
+  </p>
+  <p>
+    <b>PRIORYTET 3 - Nadwyżka, można zwiększyć (co 5s, wolny filtr):</b> Eksport > 300W?
+    Oblicz cel z uśrednionego <code>brutto - 300W</code>. Powolny filtr (alpha=0.15) - stabilne narastanie.
+    Decyzje o wzroście TYLKO co 5 sekund, żeby nie reagować na szum.
+  </p>
+  <p>
+    <b>Brutto eksport:</b> <code>brutto = zmierzony eksport + moc grzałki</code>.
+    Eliminuje sprzężenie zwrotne - brutto nie zmienia się gdy zmieniamy grzałkę.
+  </p>
+</div>
+
+<script>
+// ==================== SIMULATION ENGINE ====================
+
+const P_MAX = 2000;
+const EXPORT_RESERVE = 100;
+const CHART_POINTS = 180; // 3 minuty przy 1s
+
+// Simulation parameters (from sliders)
+let solarBase = 1800;
+let houseBase = 600;
+let noiseAmp = 80;
+let spikeAmp = 200;
+
+// Time
+let simTime = 0;
+let running = false;
+let speed = 1;
+let intervalId = null;
+
+// Solar/house simulation
+function getSolar(t) {
+  // Slow drift + medium oscillation
+  return solarBase
+    + Math.sin(t * 0.02) * 150    // slow cloud drift ~5min cycle
+    + Math.sin(t * 0.1) * 60      // medium variation
+    + Math.sin(t * 0.33) * 30;    // fast flicker
+}
+
+function getHouse(t) {
+  // Base + random spikes (fridge, kettle, etc)
+  let h = houseBase + Math.sin(t * 0.05) * 50;
+  // Random spikes every ~30s
+  if (Math.sin(t * 0.21) > 0.85) h += spikeAmp;
+  if (Math.sin(t * 0.37) > 0.9) h += spikeAmp * 0.6;
+  return h;
+}
+
+function getNoise() {
+  return (Math.random() - 0.5) * 2 * noiseAmp;
+}
+
+// ==================== OLD ALGORITHM ====================
+
+const oldState = {
+  exportBuffer: new Array(10).fill(0),
+  bufferIndex: 0,
+  bufferFull: false,
+  pStep: 0,
+  pApplied: 0,
+  lastDecisionT: -10,
+  history: { export: [], heater: [], target: [], import: [] },
+  oscillations: 0,
+  lastDirection: 0,
+};
+
+function oldTick(measuredExport, gridImport) {
+  const s = oldState;
+
+  // Buffer
+  s.exportBuffer[s.bufferIndex] = measuredExport;
+  s.bufferIndex = (s.bufferIndex + 1) % 10;
+  if (s.bufferIndex === 0) s.bufferFull = true;
+
+  // Decision every 10s
+  if (simTime - s.lastDecisionT >= 10) {
+    s.lastDecisionT = simTime;
+    const count = s.bufferFull ? 10 : s.bufferIndex || 1;
+    let sum = 0;
+    for (let i = 0; i < count; i++) sum += s.exportBuffer[i];
+    const avg = sum / count;
+
+    let dir = 0;
+    if (avg < 50) {
+      if (s.pStep >= 150) { s.pStep -= 150; dir = -1; }
+      else { s.pStep = 0; dir = -1; }
+    } else if (avg >= 250) {
+      if (s.pStep + 50 <= P_MAX) { s.pStep += 50; dir = 1; }
+      else s.pStep = P_MAX;
+    }
+
+    // Count direction changes as oscillations
+    if (dir !== 0 && s.lastDirection !== 0 && dir !== s.lastDirection) {
+      s.oscillations++;
+    }
+    if (dir !== 0) s.lastDirection = dir;
+  }
+
+  // EMA filter
+  const dt = 1;
+  const k = s.pStep > s.pApplied
+    ? dt / (8 + dt)   // TAU_UP = 8
+    : dt / (5 + dt);  // TAU_DOWN = 5
+  s.pApplied += k * (s.pStep - s.pApplied);
+  s.pApplied = Math.max(0, Math.min(P_MAX, s.pApplied));
+
+  // History
+  s.history.export.push(measuredExport);
+  s.history.heater.push(s.pApplied);
+  s.history.target.push(EXPORT_RESERVE);
+  s.history.import.push(gridImport);
+  if (s.history.export.length > CHART_POINTS) {
+    s.history.export.shift();
+    s.history.heater.shift();
+    s.history.target.shift();
+    s.history.import.shift();
+  }
+}
+
+// ==================== NEW ALGORITHM ====================
+// Based on: Mk2 PV Router (OpenEnergyMonitor), myEnergi Eddi, Catch Power
+// Key principles:
+//   1. IMPORT = natychmiastowe cięcie (bez filtra, bez czekania)
+//   2. Eksport < rezerwa = proporcjonalne obcięcie (o tyle ile brakuje)
+//   3. Wzrost = powolny, uśredniony (żeby nie reagować na szum)
+//   4. Brutto eksport = zmierzony eksport + moc grzałki (kompensacja sprzężenia)
+
+const newState = {
+  grossBuffer: new Array(10).fill(0),
+  bufferIndex: 0,
+  bufferFull: false,
+  pApplied: 0,
+  lastIncreaseT: -10,  // kiedy ostatnio zwiększyliśmy (wzrost co 5s)
+  history: { export: [], heater: [], target: [], import: [] },
+  oscillations: 0,
+  lastDirection: 0,
+};
+
+const MAX_STEP_PER_TICK = 200;  // max ±200W zmiana na sekundę
+
+function newTick(measuredExport, gridImport) {
+  const s = newState;
+  const prevApplied = s.pApplied;  // zapamiętaj przed logiką
+
+  // ── KROK 1: Brutto eksport (kompensacja sprzężenia zwrotnego) ──
+  const grossExport = measuredExport + s.pApplied;
+
+  // Bufor brutto (do uśredniania przy wzroście)
+  s.grossBuffer[s.bufferIndex] = grossExport;
+  s.bufferIndex = (s.bufferIndex + 1) % 10;
+  if (s.bufferIndex === 0) s.bufferFull = true;
+
+  const count = s.bufferFull ? 10 : Math.max(s.bufferIndex, 1);
+  let sum = 0;
+  for (let i = 0; i < count; i++) sum += s.grossBuffer[i];
+  const avgGross = sum / count;
+
+  // ── KROK 2: PRIORYTET 1 - Ochrona przed importem (NATYCHMIAST) ──
+  // Jeśli ciągniemy z sieci - tnij grzałkę o wielkość importu + rezerwa
+  // Bez filtra, bez czekania, bez uśredniania!
+  if (gridImport > 0) {
+    const cut = gridImport + EXPORT_RESERVE;
+    s.pApplied = Math.max(0, s.pApplied - cut);
+    s.pApplied = Math.round(s.pApplied / 100) * 100;
+
+    // track oscillation
+    if (s.lastDirection === 1) s.oscillations++;
+    s.lastDirection = -1;
+  }
+  // ── KROK 3: PRIORYTET 2 - Eksport poniżej rezerwy (SZYBKA reakcja) ──
+  // Eksport jest, ale za mały - zmniejsz proporcjonalnie do deficytu
+  else if (measuredExport < EXPORT_RESERVE) {
+    const deficit = EXPORT_RESERVE - measuredExport;  // ile brakuje do rezerwy
+    // Odejmij deficit - im mniej eksportu, tym więcej tniemy
+    // alpha_down = 0.7 - szybka reakcja (70% nowej wartości, 30% starej)
+    const pTarget = Math.max(0, s.pApplied - deficit);
+    s.pApplied = 0.7 * pTarget + 0.3 * s.pApplied;
+    s.pApplied = Math.max(0, s.pApplied);
+    s.pApplied = Math.round(s.pApplied / 100) * 100;
+
+    if (s.lastDirection === 1) s.oscillations++;
+    s.lastDirection = -1;
+  }
+  // ── KROK 4: PRIORYTET 3 - Nadwyżka jest, można zwiększyć (POWOLI) ──
+  // Eksport > rezerwa - mamy zapas, można spokojnie dodać moc
+  // Ale TYLKO co 5 sekund i na podstawie uśrednionego brutto
+  else {
+    if (simTime - s.lastIncreaseT >= 5) {
+      s.lastIncreaseT = simTime;
+
+      // Cel = brutto (uśrednione) - rezerwa
+      let pTarget = avgGross - EXPORT_RESERVE;
+      pTarget = Math.max(0, Math.min(P_MAX, pTarget));
+
+      if (pTarget > s.pApplied) {
+        // Powolne narastanie: alpha_up = 0.15 (15% nowego celu, 85% starego)
+        s.pApplied = 0.15 * pTarget + 0.85 * s.pApplied;
+        s.pApplied = Math.round(s.pApplied / 100) * 100;
+
+        if (s.lastDirection === -1) s.oscillations++;
+        s.lastDirection = 1;
+      }
+    }
+    // Między decyzjami wzrostu - nie ruszaj
+  }
+
+  // Rate limiter: max ±200W na tick (1s)
+  const delta = s.pApplied - prevApplied;
+  if (delta > MAX_STEP_PER_TICK) s.pApplied = prevApplied + MAX_STEP_PER_TICK;
+  if (delta < -MAX_STEP_PER_TICK) s.pApplied = prevApplied - MAX_STEP_PER_TICK;
+  s.pApplied = Math.round(s.pApplied / 100) * 100;
+
+  // Clamp
+  s.pApplied = Math.max(0, Math.min(P_MAX, s.pApplied));
+
+  // History
+  s.history.export.push(measuredExport);
+  s.history.heater.push(s.pApplied);
+  s.history.target.push(EXPORT_RESERVE);
+  s.history.import.push(gridImport);
+  if (s.history.export.length > CHART_POINTS) {
+    s.history.export.shift();
+    s.history.heater.shift();
+    s.history.target.shift();
+    s.history.import.shift();
+  }
+}
+
+// ==================== CHART DRAWING ====================
+
+function drawChart(canvasId, data, colors, maxY, highlightReserve) {
+  const canvas = document.getElementById(canvasId);
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+
+  // Grid
+  ctx.strokeStyle = '#334155';
+  ctx.lineWidth = 0.5;
+  for (let i = 0; i <= 4; i++) {
+    const y = (i / 4) * H;
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+    // Labels
+    ctx.fillStyle = '#64748b';
+    ctx.font = '11px system-ui';
+    ctx.fillText(Math.round(maxY - (i / 4) * maxY) + 'W', 4, y + 12);
+  }
+
+  // Reserve line
+  if (highlightReserve) {
+    const ry = H - (EXPORT_RESERVE / maxY) * H;
+    ctx.strokeStyle = '#fbbf2480';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([5, 5]);
+    ctx.beginPath(); ctx.moveTo(0, ry); ctx.lineTo(W, ry); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = '#fbbf24';
+    ctx.fillText('Rezerwa ' + EXPORT_RESERVE + 'W', W - 100, ry - 4);
+  }
+
+  // Data lines
+  const series = Object.keys(data);
+  series.forEach((key, si) => {
+    const arr = data[key];
+    if (arr.length < 2) return;
+    ctx.strokeStyle = colors[si];
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    for (let i = 0; i < arr.length; i++) {
+      const x = (i / (CHART_POINTS - 1)) * W;
+      const v = Math.max(0, arr[i]);
+      const y = H - (v / maxY) * H;
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  });
+}
+
+function drawSolarChart() {
+  const canvas = document.getElementById('cSolar');
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+
+  if (solarHistory.length < 2) return;
+
+  const maxY = 3000;
+
+  // Grid
+  ctx.strokeStyle = '#334155'; ctx.lineWidth = 0.5;
+  for (let i = 0; i <= 3; i++) {
+    const y = (i / 3) * H;
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+    ctx.fillStyle = '#64748b'; ctx.font = '11px system-ui';
+    ctx.fillText(Math.round(maxY - (i / 3) * maxY) + 'W', 4, y + 12);
+  }
+
+  // Solar
+  ctx.strokeStyle = '#fbbf24'; ctx.lineWidth = 2; ctx.beginPath();
+  for (let i = 0; i < solarHistory.length; i++) {
+    const x = (i / (CHART_POINTS - 1)) * W;
+    const y = H - (solarHistory[i] / maxY) * H;
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+
+  // House
+  ctx.strokeStyle = '#f87171'; ctx.lineWidth = 2; ctx.beginPath();
+  for (let i = 0; i < houseHistory.length; i++) {
+    const x = (i / (CHART_POINTS - 1)) * W;
+    const y = H - (houseHistory[i] / maxY) * H;
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+
+  // Gross surplus
+  ctx.strokeStyle = '#38bdf8'; ctx.lineWidth = 1.5; ctx.setLineDash([3,3]); ctx.beginPath();
+  for (let i = 0; i < grossHistory.length; i++) {
+    const x = (i / (CHART_POINTS - 1)) * W;
+    const v = Math.max(0, grossHistory[i]);
+    const y = H - (v / maxY) * H;
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+  ctx.setLineDash([]);
+}
+
+// ==================== MAIN LOOP ====================
+
+let solarHistory = [];
+let houseHistory = [];
+let grossHistory = [];
+
+function tick() {
+  simTime++;
+
+  const solar = getSolar(simTime);
+  const house = getHouse(simTime);
+  const noise = getNoise();
+
+  // TRUE export (what meter would show if no heater)
+  const trueGross = Math.max(0, solar - house);
+
+  // OLD: measured = gross - heater + noise (can go negative = import)
+  const oldNet = trueGross - oldState.pApplied + noise;
+  const oldMeasuredExport = Math.max(0, oldNet);
+  const oldGridImport = Math.max(0, -oldNet);  // import = ciągniemy z sieci
+  oldTick(oldMeasuredExport, oldGridImport);
+
+  // NEW: same physics
+  const newNet = trueGross - newState.pApplied + noise;
+  const newMeasuredExport = Math.max(0, newNet);
+  const newGridImport = Math.max(0, -newNet);
+  newTick(newMeasuredExport, newGridImport);
+
+  // Solar chart history
+  solarHistory.push(solar);
+  houseHistory.push(house);
+  grossHistory.push(trueGross);
+  if (solarHistory.length > CHART_POINTS) {
+    solarHistory.shift(); houseHistory.shift(); grossHistory.shift();
+  }
+
+  // Update charts
+  drawSolarChart();
+  drawChart('cOld',
+    { export: oldState.history.export, heater: oldState.history.heater, import: oldState.history.import },
+    ['#f87171', '#fb923c', '#e879f9'], P_MAX, true);
+  drawChart('cNew',
+    { export: newState.history.export, heater: newState.history.heater, import: newState.history.import },
+    ['#4ade80', '#22d3ee', '#e879f9'], P_MAX, true);
+
+  // Update stats
+  const oldE = oldState.history.export;
+  const newE = newState.history.export;
+  const oldI = oldState.history.import;
+  const newI = newState.history.import;
+  document.getElementById('oldHeater').textContent = Math.round(oldState.pApplied) + ' W';
+  document.getElementById('oldExport').textContent = Math.round(oldE[oldE.length-1] || 0) + ' W';
+  document.getElementById('oldImport').textContent = Math.round(oldI[oldI.length-1] || 0) + ' W';
+  document.getElementById('oldOsc').textContent = oldState.oscillations;
+  document.getElementById('newHeater').textContent = Math.round(newState.pApplied) + ' W';
+  document.getElementById('newExport').textContent = Math.round(newE[newE.length-1] || 0) + ' W';
+  document.getElementById('newImport').textContent = Math.round(newI[newI.length-1] || 0) + ' W';
+  document.getElementById('newOsc').textContent = newState.oscillations;
+}
+
+function resetSim() {
+  simTime = 0;
+  // Reset old
+  oldState.exportBuffer.fill(0);
+  oldState.bufferIndex = 0; oldState.bufferFull = false;
+  oldState.pStep = 0; oldState.pApplied = 0;
+  oldState.lastDecisionT = -10;
+  oldState.history = { export: [], heater: [], target: [], import: [] };
+  oldState.oscillations = 0; oldState.lastDirection = 0;
+  // Reset new
+  newState.grossBuffer.fill(0);
+  newState.bufferIndex = 0; newState.bufferFull = false;
+  newState.pApplied = 0; newState.lastIncreaseT = -10;
+  newState.history = { export: [], heater: [], target: [], import: [] };
+  newState.oscillations = 0; newState.lastDirection = 0;
+  // Reset solar
+  solarHistory = []; houseHistory = []; grossHistory = [];
+}
+
+// ==================== UI ====================
+
+document.getElementById('btnStart').addEventListener('click', () => {
+  if (running) {
+    running = false;
+    clearInterval(intervalId);
+    document.getElementById('btnStart').textContent = 'START';
+    document.getElementById('btnStart').classList.remove('btn-reset');
+    document.getElementById('btnStart').classList.add('btn-start');
+  } else {
+    running = true;
+    document.getElementById('btnStart').textContent = 'STOP';
+    document.getElementById('btnStart').classList.remove('btn-start');
+    document.getElementById('btnStart').classList.add('btn-reset');
+    startInterval();
+  }
+});
+
+function startInterval() {
+  clearInterval(intervalId);
+  const ms = speed === 1 ? 200 : speed === 5 ? 40 : 10;
+  intervalId = setInterval(tick, ms);
+}
+
+document.getElementById('btnReset').addEventListener('click', () => {
+  resetSim();
+  drawSolarChart();
+  drawChart('cOld', { export: [], heater: [] }, ['#f87171', '#fb923c'], P_MAX, true);
+  drawChart('cNew', { export: [], heater: [] }, ['#4ade80', '#22d3ee'], P_MAX, true);
+  document.getElementById('oldHeater').textContent = '0 W';
+  document.getElementById('oldExport').textContent = '0 W';
+  document.getElementById('oldImport').textContent = '0 W';
+  document.getElementById('oldOsc').textContent = '0';
+  document.getElementById('newHeater').textContent = '0 W';
+  document.getElementById('newExport').textContent = '0 W';
+  document.getElementById('newImport').textContent = '0 W';
+  document.getElementById('newOsc').textContent = '0';
+});
+
+document.getElementById('btnSpeed').addEventListener('click', () => {
+  if (speed === 1) speed = 5;
+  else if (speed === 5) speed = 20;
+  else speed = 1;
+  document.getElementById('btnSpeed').textContent = 'Prędkość: ' + speed + 'x';
+  if (running) startInterval();
+});
+
+// Sliders
+document.getElementById('solarSlider').addEventListener('input', (e) => {
+  solarBase = +e.target.value;
+  document.getElementById('solarVal').textContent = solarBase + ' W';
+});
+document.getElementById('houseSlider').addEventListener('input', (e) => {
+  houseBase = +e.target.value;
+  document.getElementById('houseVal').textContent = houseBase + ' W';
+});
+document.getElementById('noiseSlider').addEventListener('input', (e) => {
+  noiseAmp = +e.target.value;
+  document.getElementById('noiseVal').textContent = '±' + noiseAmp + ' W';
+});
+document.getElementById('spikeSlider').addEventListener('input', (e) => {
+  spikeAmp = +e.target.value;
+  document.getElementById('spikeVal').textContent = '±' + spikeAmp + ' W';
+});
+
+// Initial draw
+drawChart('cOld', { export: [], heater: [] }, ['#f87171', '#fb923c'], P_MAX, true);
+drawChart('cNew', { export: [], heater: [] }, ['#4ade80', '#22d3ee'], P_MAX, true);
+</script>
+</body>
+</html>
