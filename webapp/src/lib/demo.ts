@@ -9,8 +9,8 @@ let demoStartedAt = 0;
 // Simulation parameters
 let solarBase = 1800;
 let houseBase = 600;
-let noiseAmp = 80;
-let spikeAmp = 200;
+let noiseAmp = 0;
+let spikeAmp = 50;
 
 function getSolar(t: number): number {
   return (

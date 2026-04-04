@@ -207,8 +207,8 @@ export default function Dashboard() {
   const [demo, setDemo] = useState<DemoState | null>(null);
   const [demoSolar, setDemoSolar] = useState(1800);
   const [demoHouse, setDemoHouse] = useState(600);
-  const [demoNoise, setDemoNoise] = useState(80);
-  const [demoSpike, setDemoSpike] = useState(200);
+  const [demoNoise, setDemoNoise] = useState(0);
+  const [demoSpike, setDemoSpike] = useState(50);
 
   // Check if already authenticated
   useEffect(() => {
