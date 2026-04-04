@@ -362,7 +362,7 @@ void setup() {
 
   lastResponseMs = millis();
   lastHalfMs = millis();
-  localLastTickMs = millis();
+  localLastIncreaseMs = millis();
   pollMeter();
 }
 
