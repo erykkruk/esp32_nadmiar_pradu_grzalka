@@ -326,10 +326,10 @@ export default function Dashboard() {
     fetchStats();
     fetchDemo();
 
-    const statusInterval = setInterval(fetchStatus, 2000);
-    const historyInterval = setInterval(fetchHistory, demoRunning ? 2000 : 15000);
+    const statusInterval = setInterval(fetchStatus, 200);
+    const historyInterval = setInterval(fetchHistory, 500);
     const statsInterval = setInterval(fetchStats, 60000);
-    const demoInterval = setInterval(fetchDemo, 5000);
+    const demoInterval = setInterval(fetchDemo, 3000);
 
     return () => {
       clearInterval(statusInterval);

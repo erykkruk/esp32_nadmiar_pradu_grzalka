@@ -69,8 +69,8 @@ export function startDemo(params?: {
 
   demoStartedAt = Date.now();
 
-  // Run at 1 tick per second (real-time simulation)
-  demoInterval = setInterval(demoTick, 1000);
+  // Run at 5 ticks per second for smooth charts
+  demoInterval = setInterval(demoTick, 200);
   // First tick immediately
   demoTick();
 }
