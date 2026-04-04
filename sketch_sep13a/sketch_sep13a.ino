@@ -55,8 +55,8 @@ const int   GROSS_BUFFER_SIZE = 10;
 
 // 3-priority algorithm constants (same as server)
 const float ALPHA_DOWN       = 0.7f;    // Fast filter for decrease
-const float ALPHA_UP         = 0.15f;   // Slow filter for increase
-const unsigned long INCREASE_INTERVAL_MS = 5000; // Increase only every 5s
+const float ALPHA_UP         = 0.4f;    // Filter for increase
+const unsigned long INCREASE_INTERVAL_MS = 2000; // Increase every 2s
 const float MAX_STEP_W       = 200.0f;  // Max change per tick [W]
 
 //////////////////// Offline Timeout ////////////////////

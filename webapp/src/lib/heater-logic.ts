@@ -7,8 +7,8 @@ let lastIncreaseMs = 0;
 
 // 3-priority algorithm constants (matching simulation.html)
 const ALPHA_DOWN = 0.7; // Fast filter for decrease (70% new, 30% old)
-const ALPHA_UP = 0.15; // Slow filter for increase (15% new, 85% old)
-const INCREASE_INTERVAL_MS = 5000; // Only increase every 5s
+const ALPHA_UP = 0.4; // Filter for increase (40% new, 60% old)
+const INCREASE_INTERVAL_MS = 2000; // Increase every 2s
 const MAX_STEP_W = 200; // Max change per tick [W]
 
 export interface ReportResult {
