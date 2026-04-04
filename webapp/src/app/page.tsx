@@ -317,6 +317,8 @@ export default function Dashboard() {
     });
   };
 
+  const demoRunning = demo?.running ?? false;
+
   useEffect(() => {
     if (!authed) return;
     fetchStatus();
@@ -325,7 +327,7 @@ export default function Dashboard() {
     fetchDemo();
 
     const statusInterval = setInterval(fetchStatus, 2000);
-    const historyInterval = setInterval(fetchHistory, 10000);
+    const historyInterval = setInterval(fetchHistory, demoRunning ? 2000 : 15000);
     const statsInterval = setInterval(fetchStats, 60000);
     const demoInterval = setInterval(fetchDemo, 5000);
 
@@ -335,7 +337,7 @@ export default function Dashboard() {
       clearInterval(statsInterval);
       clearInterval(demoInterval);
     };
-  }, [authed, fetchStatus, fetchHistory, fetchStats, fetchDemo]);
+  }, [authed, demoRunning, fetchStatus, fetchHistory, fetchStats, fetchDemo]);
 
   // Loading
   if (authed === null) return null;
