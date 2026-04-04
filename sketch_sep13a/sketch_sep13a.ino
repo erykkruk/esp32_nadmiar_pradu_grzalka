@@ -51,9 +51,13 @@ const int N_HALF = HALF_CYCLES_PER_SECOND;
 //////////////////// Control Algorithm Constants ////////////////////
 // Same values as server (constants.ts)
 const float EXPORT_RESERVE_W = 100.0f;
-const float TAU_UP           = 8.0f;    // EMA rise [s]
-const float TAU_DOWN         = 5.0f;    // EMA fall [s]
 const int   GROSS_BUFFER_SIZE = 10;
+
+// 3-priority algorithm constants (same as server)
+const float ALPHA_DOWN       = 0.7f;    // Fast filter for decrease
+const float ALPHA_UP         = 0.15f;   // Slow filter for increase
+const unsigned long INCREASE_INTERVAL_MS = 5000; // Increase only every 5s
+const float MAX_STEP_W       = 200.0f;  // Max change per tick [W]
 
 //////////////////// Offline Timeout ////////////////////
 const unsigned long OFFLINE_THRESHOLD_MS = 10000;  // 10s without server -> go LOCAL
@@ -81,8 +85,8 @@ unsigned long lastResponseMs = 0;
 float localGrossBuffer[GROSS_BUFFER_SIZE];
 int   localBufferIndex = 0;
 bool  localBufferFull = false;
-float localPApplied = 0.0f;       // Power after EMA [W]
-unsigned long localLastTickMs = 0; // For dt calculation
+float localPApplied = 0.0f;       // Power after filter [W]
+unsigned long localLastIncreaseMs = 0; // For increase interval
 
 // Timing
 unsigned long lastPollMs = 0;
@@ -159,45 +163,65 @@ float getLocalAverageGross() {
 
 void runLocalAlgorithm() {
   unsigned long now = millis();
+  float prevApplied = localPApplied;
 
-  // Step 1: measured export
+  // Measured export and import
   float measuredExport = (powerW < 0.0f) ? -powerW : 0.0f;
+  float gridImport     = (powerW > 0.0f) ?  powerW : 0.0f;
 
-  // Step 2: gross export = measured + heater (removes feedback loop)
+  // Gross export = measured + heater (removes feedback loop)
   float grossExport = measuredExport + localPApplied;
 
-  // Step 3: add to circular buffer
+  // Add to circular buffer
   localGrossBuffer[localBufferIndex] = grossExport;
   localBufferIndex = (localBufferIndex + 1) % GROSS_BUFFER_SIZE;
   if (localBufferIndex == 0) localBufferFull = true;
 
-  // Step 4: proportional target
-  float avgGross = getLocalAverageGross();
-  float pTarget = avgGross - EXPORT_RESERVE_W;
-  if (pTarget < 0.0f) pTarget = 0.0f;
-  if (pTarget > P_MAX) pTarget = P_MAX;
+  // === 3-PRIORITY ALGORITHM (same as server & simulation.html) ===
 
-  // Step 5: EMA filter
-  float dt = (localLastTickMs > 0) ? (float)(now - localLastTickMs) / 1000.0f : 1.0f;
-  float tau = (pTarget > localPApplied) ? TAU_UP : TAU_DOWN;
-  float k = dt / (tau + dt);
-  localPApplied = localPApplied + k * (pTarget - localPApplied);
-  if (localPApplied < 0.0f) localPApplied = 0.0f;
-  if (localPApplied > P_MAX) localPApplied = P_MAX;
-  localLastTickMs = now;
+  // PRIORITY 1: Import → immediate cut, no filter
+  if (gridImport > 0.0f) {
+    float cut = gridImport + EXPORT_RESERVE_W;
+    localPApplied = max(0.0f, localPApplied - cut);
+    Serial.printf("LOCAL P1-IMPORT: cut=%.0fW applied=%.0fW\n", cut, localPApplied);
+  }
+  // PRIORITY 2: Export below reserve → fast proportional reduction
+  else if (measuredExport < EXPORT_RESERVE_W) {
+    float deficit = EXPORT_RESERVE_W - measuredExport;
+    float target = max(0.0f, localPApplied - deficit);
+    localPApplied = ALPHA_DOWN * target + (1.0f - ALPHA_DOWN) * localPApplied;
+    Serial.printf("LOCAL P2-LOW: deficit=%.0fW applied=%.0fW\n", deficit, localPApplied);
+  }
+  // PRIORITY 3: Surplus → slow increase (only every 5s)
+  else {
+    if (now - localLastIncreaseMs >= INCREASE_INTERVAL_MS) {
+      localLastIncreaseMs = now;
+      float avgGross = getLocalAverageGross();
+      float target = constrain(avgGross - EXPORT_RESERVE_W, 0.0f, P_MAX);
+      if (target > localPApplied) {
+        localPApplied = ALPHA_UP * target + (1.0f - ALPHA_UP) * localPApplied;
+        Serial.printf("LOCAL P3-UP: avg=%.0fW target=%.0fW applied=%.0fW\n", avgGross, target, localPApplied);
+      }
+    }
+  }
 
-  // Step 6: set duty
+  // Rate limiter: max ±200W per tick
+  float delta = localPApplied - prevApplied;
+  if (delta >  MAX_STEP_W) localPApplied = prevApplied + MAX_STEP_W;
+  if (delta < -MAX_STEP_W) localPApplied = prevApplied - MAX_STEP_W;
+
+  // Clamp
+  localPApplied = constrain(localPApplied, 0.0f, P_MAX);
+
+  // Set duty
   float dutyPct = (localPApplied / P_MAX) * 100.0f;
   setDuty(dutyPct);
-
-  Serial.printf("LOCAL: gross=%.0fW avg=%.0fW target=%.0fW applied=%.0fW duty=%.1f%%\n",
-                grossExport, avgGross, pTarget, localPApplied, dutyPct);
 }
 
 void resetLocalState() {
   // Sync local state with current SSR output so there's no jump
   localPApplied = (currentDutyPct / 100.0f) * P_MAX;
-  localLastTickMs = millis();
+  localLastIncreaseMs = millis();
   // Reset buffer - will fill up with fresh data
   localBufferIndex = 0;
   localBufferFull = false;
