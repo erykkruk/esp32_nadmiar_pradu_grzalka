@@ -10,7 +10,10 @@ import {
   Tooltip,
   ResponsiveContainer,
   ReferenceLine,
+  Legend,
 } from "recharts";
+
+const APP_VERSION = "2.0.0";
 
 interface Status {
   mode: "auto" | "manual";
@@ -33,7 +36,7 @@ interface HistoryReading {
   grid_import_w: number;
   export_w: number;
   heater_w: number;
-  avg_export_w: number; // gross export in DB
+  avg_export_w: number;
   p_target: number;
   p_applied: number;
 }
@@ -86,11 +89,106 @@ function timeSince(ts: number): string {
 function formatUptime(s: number): string {
   if (s < 60) return `${s}s`;
   if (s < 3600) return `${Math.floor(s / 60)}m`;
-  if (s < 86400) return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
+  if (s < 86400)
+    return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
   return `${Math.floor(s / 86400)}d ${Math.floor((s % 86400) / 3600)}h`;
 }
 
+// ==================== LOGIN SCREEN ====================
+
+function LoginScreen({ onLogin }: { onLogin: () => void }) {
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState(false);
+  const [loading, setLoading] = useState(false);
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setLoading(true);
+    setError(false);
+
+    const res = await fetch("/api/auth", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ password }),
+    });
+
+    if (res.ok) {
+      onLogin();
+    } else {
+      setError(true);
+    }
+    setLoading(false);
+  };
+
+  return (
+    <div
+      style={{
+        display: "flex",
+        justifyContent: "center",
+        alignItems: "center",
+        minHeight: "100vh",
+      }}
+    >
+      <div className="card" style={{ width: 320, textAlign: "center" }}>
+        <h2 style={{ marginBottom: 16 }}>ESP32 Heater Control</h2>
+        <form onSubmit={submit}>
+          <input
+            type="password"
+            placeholder="Haslo"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            autoFocus
+            style={{
+              width: "100%",
+              padding: "10px 12px",
+              borderRadius: 8,
+              border: `1px solid ${error ? "var(--red)" : "var(--border)"}`,
+              background: "var(--bg)",
+              color: "var(--text)",
+              fontSize: "1rem",
+              marginBottom: 12,
+            }}
+          />
+          {error && (
+            <p style={{ color: "var(--red)", fontSize: "0.85rem", marginBottom: 8 }}>
+              Nieprawidlowe haslo
+            </p>
+          )}
+          <button
+            type="submit"
+            disabled={loading}
+            style={{
+              width: "100%",
+              padding: "10px",
+              borderRadius: 8,
+              border: "none",
+              background: "var(--blue)",
+              color: "white",
+              fontSize: "1rem",
+              cursor: "pointer",
+            }}
+          >
+            {loading ? "..." : "Zaloguj"}
+          </button>
+        </form>
+        <p
+          style={{
+            marginTop: 16,
+            fontSize: "0.7rem",
+            color: "var(--muted)",
+          }}
+        >
+          v{APP_VERSION}
+        </p>
+      </div>
+    </div>
+  );
+}
+
+// ==================== DASHBOARD ====================
+
 export default function Dashboard() {
+  const [authed, setAuthed] = useState<boolean | null>(null);
   const [status, setStatus] = useState<Status | null>(null);
   const [history, setHistory] = useState<HistoryReading[]>([]);
   const [stats, setStats] = useState<DbStats | null>(null);
@@ -98,9 +196,20 @@ export default function Dashboard() {
   const [sliderDuty, setSliderDuty] = useState(0);
   const [sliderActive, setSliderActive] = useState(false);
 
+  // Check if already authenticated
+  useEffect(() => {
+    fetch("/api/status")
+      .then((res) => setAuthed(res.ok))
+      .catch(() => setAuthed(false));
+  }, []);
+
   const fetchStatus = useCallback(async () => {
     try {
       const res = await fetch("/api/status");
+      if (res.status === 401) {
+        setAuthed(false);
+        return;
+      }
       if (res.ok) {
         const data = await res.json();
         setStatus(data);
@@ -153,6 +262,7 @@ export default function Dashboard() {
   };
 
   useEffect(() => {
+    if (!authed) return;
     fetchStatus();
     fetchHistory();
     fetchStats();
@@ -166,12 +276,26 @@ export default function Dashboard() {
       clearInterval(historyInterval);
       clearInterval(statsInterval);
     };
-  }, [fetchStatus, fetchHistory, fetchStats]);
+  }, [authed, fetchStatus, fetchHistory, fetchStats]);
+
+  // Loading
+  if (authed === null) return null;
+
+  // Login screen
+  if (!authed) {
+    return (
+      <LoginScreen
+        onLogin={() => {
+          setAuthed(true);
+        }}
+      />
+    );
+  }
 
   const chartData = history.map((r) => ({
     ...r,
     time: formatTime(r.ts, range),
-    gross_export_w: r.avg_export_w, // avg_export_w stores gross in DB
+    gross_export_w: r.avg_export_w,
   }));
 
   const isAuto = status?.mode === "auto";
@@ -302,7 +426,7 @@ export default function Dashboard() {
         </div>
       </div>
 
-      {/* Main chart: heater + export + gross */}
+      {/* Chart 1: Heater + export + gross */}
       <div className="chart-card">
         <div className="chart-header">
           <span className="chart-title">Moc grzalki, eksport i brutto</span>
@@ -327,7 +451,7 @@ export default function Dashboard() {
               fontSize={11}
               tickCount={8}
             />
-            <YAxis stroke="#a1a1aa" fontSize={11} />
+            <YAxis stroke="#a1a1aa" fontSize={11} unit=" W" />
             <Tooltip
               contentStyle={{
                 background: "#1a1a1a",
@@ -342,6 +466,16 @@ export default function Dashboard() {
                   gross_export_w: "Brutto eksport",
                 };
                 return [formatW(value), labels[name] || name];
+              }}
+            />
+            <Legend
+              formatter={(value: string) => {
+                const labels: Record<string, string> = {
+                  heater_w: "Grzalka",
+                  export_w: "Eksport",
+                  gross_export_w: "Brutto eksport",
+                };
+                return labels[value] || value;
               }}
             />
             <ReferenceLine
@@ -383,7 +517,7 @@ export default function Dashboard() {
         </ResponsiveContainer>
       </div>
 
-      {/* Grid import chart */}
+      {/* Chart 2: Grid import */}
       <div className="chart-card">
         <div className="chart-header">
           <span className="chart-title">Pobor z sieci</span>
@@ -397,7 +531,7 @@ export default function Dashboard() {
               fontSize={11}
               tickCount={8}
             />
-            <YAxis stroke="#a1a1aa" fontSize={11} />
+            <YAxis stroke="#a1a1aa" fontSize={11} unit=" W" />
             <Tooltip
               contentStyle={{
                 background: "#1a1a1a",
@@ -405,7 +539,7 @@ export default function Dashboard() {
                 borderRadius: 8,
                 fontSize: 13,
               }}
-              formatter={(value: number) => [formatW(value), "Pobor"]}
+              formatter={(value: number) => [formatW(value), "Pobor z sieci"]}
             />
             <ReferenceLine y={0} stroke="#555" />
             <Line
@@ -414,18 +548,20 @@ export default function Dashboard() {
               stroke="#ef4444"
               strokeWidth={2}
               dot={false}
+              name="Pobor"
             />
           </LineChart>
         </ResponsiveContainer>
       </div>
 
+      {/* Footer */}
       <div className="footer">
         <span>
           {stats?.oldestTs
             ? `Dane od: ${new Date(stats.oldestTs).toLocaleDateString("pl-PL")}`
             : "Brak danych"}
         </span>
-        <span>ESP32 Heater Control v2 (brutto eksport)</span>
+        <span>v{APP_VERSION}</span>
       </div>
     </div>
   );

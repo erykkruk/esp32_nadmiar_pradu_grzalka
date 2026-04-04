@@ -1,0 +1,8 @@
+# ESP32 secrets
+sketch_sep13a/config.h
+
+# macOS
+.DS_Store
+
+# Arduino build
+build/

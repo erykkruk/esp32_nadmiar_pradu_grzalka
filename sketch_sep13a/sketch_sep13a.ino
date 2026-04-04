@@ -1,40 +1,37 @@
 /*
-  ESP32 Heater Control v2 - "Dumb Executor" with Server-Side Logic
-  (System Kontroli Grzalki ESP32 v2 - "Glupi Executor" z Logika po Stronie Serwera)
+  ESP32 Heater Control v2 - Server-Controlled with Offline Fallback
+  (System Kontroli Grzalki ESP32 v2 - Sterowanie Serwerowe z Trybem Offline)
 
-  Architecture (Architektura):
-    ESP32 reads power from meter and sends to Next.js server every 1s.
-    Server runs control algorithm (gross export, proportional targeting, EMA).
-    Server responds with duty% for SSR.
-    ESP32 just sets the duty on SSR - no control logic here.
+  Architecture:
+    ONLINE:  ESP reads meter -> POST to server -> gets duty% -> sets SSR
+    OFFLINE: ESP reads meter -> runs local algorithm (same as server) -> sets SSR
 
-  Safety System (System Bezpieczenstwa):
-    NORMAL  --(no response 10s)--> RAMP_DOWN --(duty=0%)--> SAFE_MODE
-    ESP does NOT depend on server to safely shut down.
+  Local algorithm (identical to server):
+    - Gross export = measured export + heater power (no feedback loop)
+    - Target = avg gross - 100W reserve (proportional)
+    - EMA filter (TAU_UP=8s, TAU_DOWN=5s)
+
+  Safety: after 10s without server -> switches to LOCAL mode (not ramp down!)
+          Local mode runs the full algorithm autonomously.
 
   Hardware:
     RS485/Modbus: Serial2 RX=GPIO16, TX=GPIO17, DE/RE=GPIO4, 9600 O-8-1
     SSR Control:  GPIO13 (burst-fire, 50Hz half-cycles)
     Energy Meter: DTSU666, slave ID=1, register 0x2012
-
-  Network:
-    WiFi: configurable below
-    Server: POST /api/esp/report every 1s
 */
 
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ModbusMaster.h>
+#include "config.h"  // <- Skopiuj config.example.h jako config.h i uzupelnij
 
-//////////////////// Wi-Fi Configuration ////////////////////
-const char* WIFI_SSID = "TP-Link_E6D1";
-const char* WIFI_PASS = "80246459";
-IPAddress local_IP(192,168,255,50), gateway(192,168,255,1),
-         subnet(255,255,255,0), dns1(192,168,255,1), dns2(8,8,8,8);
-
-//////////////////// Server Configuration ////////////////////
-const char* SERVER_URL = "https://TWOJ-ADRES.coolify.app/api/esp/report";  // <- ZMIEN
-const char* API_KEY    = "change-me-to-a-random-secret";                    // <- ZMIEN
+//////////////////// Configuration from config.h ////////////////////
+const char* WIFI_SSID  = CFG_WIFI_SSID;
+const char* WIFI_PASS  = CFG_WIFI_PASS;
+IPAddress local_IP(CFG_IP_ADDR), gateway(CFG_IP_GATEWAY),
+         subnet(CFG_IP_SUBNET), dns1(CFG_IP_DNS1), dns2(CFG_IP_DNS2);
+const char* SERVER_URL = CFG_SERVER_URL;
+const char* API_KEY    = CFG_API_KEY;
 
 //////////////////// RS485 / Modbus Configuration ////////////////////
 #define RS485_DE_RE 4
@@ -48,34 +45,49 @@ ModbusMaster node;
 //////////////////// SSR Configuration ////////////////////
 const int SSR_PIN = 13;
 const float P_MAX = 2000.0f;
-const int HALF_CYCLES_PER_SECOND = 100;  // 50Hz = 100 half-cycles/s
-const int N_HALF = HALF_CYCLES_PER_SECOND;  // 1 second window
+const int HALF_CYCLES_PER_SECOND = 100;
+const int N_HALF = HALF_CYCLES_PER_SECOND;
 
-//////////////////// Safety Configuration ////////////////////
-const unsigned long GRACE_PERIOD_MS     = 10000;  // 10s normal tolerance
-const unsigned long RAMP_DOWN_START_MS  = 10000;  // Start ramping after 10s
-const float         RAMP_STEP_PCT       = 5.0f;   // -5% per second
-const float         SAFE_MODE_DUTY      = 0.0f;
+//////////////////// Control Algorithm Constants ////////////////////
+// Same values as server (constants.ts)
+const float EXPORT_RESERVE_W = 100.0f;
+const float TAU_UP           = 8.0f;    // EMA rise [s]
+const float TAU_DOWN         = 5.0f;    // EMA fall [s]
+const int   GROSS_BUFFER_SIZE = 10;
+
+//////////////////// Offline Timeout ////////////////////
+const unsigned long OFFLINE_THRESHOLD_MS = 10000;  // 10s without server -> go LOCAL
 
 //////////////////// State Variables ////////////////////
+
+// Operating mode
+enum ControlSource { SOURCE_SERVER, SOURCE_LOCAL };
+ControlSource controlSource = SOURCE_SERVER;
+
 // Meter reading
-float powerW = 0.0f;           // Current power reading [W] (+ import, - export)
+float powerW = 0.0f;
 unsigned long lastMeterOkMs = 0;
 
 // SSR control
-float currentDutyPct = 0.0f;   // Current duty cycle [0-100]
-int   onCycles = 0;            // Half-cycles ON per window
+float currentDutyPct = 0.0f;
+int   onCycles = 0;
 int   phaseIndex = 0;
 unsigned long lastHalfMs = 0;
 
-// Safety
-unsigned long lastResponseMs = 0;  // Last successful server response
-bool safeMode = false;
+// Server timing
+unsigned long lastResponseMs = 0;
+
+// Local algorithm state (mirrors server's store)
+float localGrossBuffer[GROSS_BUFFER_SIZE];
+int   localBufferIndex = 0;
+bool  localBufferFull = false;
+float localPApplied = 0.0f;       // Power after EMA [W]
+unsigned long localLastTickMs = 0; // For dt calculation
 
 // Timing
 unsigned long lastPollMs = 0;
 unsigned long lastSendMs = 0;
-unsigned long lastSafetyCheckMs = 0;
+unsigned long lastLocalTickMs = 0;
 
 //////////////////// RS485 Direction Control ////////////////////
 void preTransmission()  { digitalWrite(RS485_DE_RE, HIGH); }
@@ -115,7 +127,7 @@ void setDuty(float pct) {
 }
 
 void halfCycleTick() {
-  const unsigned long HALF_MS = 10;  // 10ms per half-cycle at 50Hz
+  const unsigned long HALF_MS = 10;
   unsigned long now = millis();
 
   if (now - lastHalfMs >= HALF_MS) {
@@ -132,27 +144,81 @@ void halfCycleTick() {
   }
 }
 
-//////////////////// Safety System ////////////////////
-void checkSafety() {
-  unsigned long elapsed = millis() - lastResponseMs;
+//////////////////// Local Algorithm (same as server) ////////////////////
 
-  if (elapsed < GRACE_PERIOD_MS) {
-    // NORMAL - server responding, keep current duty
-    safeMode = false;
-    return;
+float getLocalAverageGross() {
+  int count = localBufferFull ? GROSS_BUFFER_SIZE : localBufferIndex;
+  if (count == 0) return 0.0f;
+
+  float sum = 0.0f;
+  for (int i = 0; i < count; i++) {
+    sum += localGrossBuffer[i];
   }
+  return sum / count;
+}
 
-  if (currentDutyPct > SAFE_MODE_DUTY) {
-    // RAMP_DOWN - gradually decrease
-    float newDuty = currentDutyPct - RAMP_STEP_PCT;
-    if (newDuty < 0) newDuty = 0;
-    setDuty(newDuty);
-    Serial.printf("RAMP_DOWN: duty=%.1f%% (no response for %lums)\n",
-                  currentDutyPct, elapsed);
-  } else {
-    // SAFE_MODE - SSR OFF, waiting for server
-    safeMode = true;
-    setDuty(0);
+void runLocalAlgorithm() {
+  unsigned long now = millis();
+
+  // Step 1: measured export
+  float measuredExport = (powerW < 0.0f) ? -powerW : 0.0f;
+
+  // Step 2: gross export = measured + heater (removes feedback loop)
+  float grossExport = measuredExport + localPApplied;
+
+  // Step 3: add to circular buffer
+  localGrossBuffer[localBufferIndex] = grossExport;
+  localBufferIndex = (localBufferIndex + 1) % GROSS_BUFFER_SIZE;
+  if (localBufferIndex == 0) localBufferFull = true;
+
+  // Step 4: proportional target
+  float avgGross = getLocalAverageGross();
+  float pTarget = avgGross - EXPORT_RESERVE_W;
+  if (pTarget < 0.0f) pTarget = 0.0f;
+  if (pTarget > P_MAX) pTarget = P_MAX;
+
+  // Step 5: EMA filter
+  float dt = (localLastTickMs > 0) ? (float)(now - localLastTickMs) / 1000.0f : 1.0f;
+  float tau = (pTarget > localPApplied) ? TAU_UP : TAU_DOWN;
+  float k = dt / (tau + dt);
+  localPApplied = localPApplied + k * (pTarget - localPApplied);
+  if (localPApplied < 0.0f) localPApplied = 0.0f;
+  if (localPApplied > P_MAX) localPApplied = P_MAX;
+  localLastTickMs = now;
+
+  // Step 6: set duty
+  float dutyPct = (localPApplied / P_MAX) * 100.0f;
+  setDuty(dutyPct);
+
+  Serial.printf("LOCAL: gross=%.0fW avg=%.0fW target=%.0fW applied=%.0fW duty=%.1f%%\n",
+                grossExport, avgGross, pTarget, localPApplied, dutyPct);
+}
+
+void resetLocalState() {
+  // Sync local state with current SSR output so there's no jump
+  localPApplied = (currentDutyPct / 100.0f) * P_MAX;
+  localLastTickMs = millis();
+  // Reset buffer - will fill up with fresh data
+  localBufferIndex = 0;
+  localBufferFull = false;
+  for (int i = 0; i < GROSS_BUFFER_SIZE; i++) {
+    localGrossBuffer[i] = 0.0f;
+  }
+}
+
+//////////////////// Mode Management ////////////////////
+void updateControlSource() {
+  unsigned long elapsed = millis() - lastResponseMs;
+  ControlSource newSource = (elapsed < OFFLINE_THRESHOLD_MS) ? SOURCE_SERVER : SOURCE_LOCAL;
+
+  if (newSource != controlSource) {
+    if (newSource == SOURCE_LOCAL) {
+      Serial.println(">>> SWITCHING TO LOCAL MODE (server unreachable)");
+      resetLocalState();
+    } else {
+      Serial.println(">>> SWITCHING TO SERVER MODE (server back online)");
+    }
+    controlSource = newSource;
   }
 }
 
@@ -167,18 +233,20 @@ void sendReport() {
   http.setTimeout(5000);
 
   unsigned long secsSinceResponse = (millis() - lastResponseMs) / 1000;
+  bool isLocal = (controlSource == SOURCE_LOCAL);
 
-  char payload[256];
+  char payload[300];
   snprintf(payload, sizeof(payload),
     "{\"power_w\":%.1f,\"uptime_s\":%lu,\"wifi_rssi\":%d,"
     "\"free_heap\":%u,\"current_duty_pct\":%.1f,"
-    "\"safe_mode\":%s,\"seconds_since_last_response\":%lu}",
+    "\"safe_mode\":false,\"offline_mode\":%s,"
+    "\"seconds_since_last_response\":%lu}",
     powerW,
     millis() / 1000,
     WiFi.RSSI(),
     ESP.getFreeHeap(),
     currentDutyPct,
-    safeMode ? "true" : "false",
+    isLocal ? "true" : "false",
     secsSinceResponse
   );
 
@@ -187,15 +255,22 @@ void sendReport() {
   if (httpCode == 200) {
     String response = http.getString();
     lastResponseMs = millis();
-    safeMode = false;
 
-    // Parse duty_pct from response: {"duty_pct":35.8,"mode":"auto","ack":true}
+    // Only apply server duty if we're in SERVER mode
+    // (updateControlSource will switch us back on next tick)
     int dutyIdx = response.indexOf("\"duty_pct\":");
     if (dutyIdx >= 0) {
-      int valueStart = dutyIdx + 11;  // length of "duty_pct":
+      int valueStart = dutyIdx + 11;
       float newDuty = response.substring(valueStart).toFloat();
-      setDuty(newDuty);
-      Serial.printf("Server OK: duty=%.1f%% power=%.1fW\n", newDuty, powerW);
+
+      if (controlSource == SOURCE_SERVER) {
+        setDuty(newDuty);
+      }
+      // If still LOCAL, we'll switch to SERVER on next updateControlSource()
+      // and the next server response will be applied
+
+      Serial.printf("Server OK: duty=%.1f%% power=%.1fW (source=%s)\n",
+                    newDuty, powerW, isLocal ? "LOCAL" : "SERVER");
     }
   } else {
     Serial.printf("Server error: HTTP %d\n", httpCode);
@@ -215,7 +290,7 @@ void ensureWiFi() {
   unsigned long t0 = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) {
     delay(200);
-    halfCycleTick();  // Keep SSR timing alive during reconnect
+    halfCycleTick();
   }
 
   if (WiFi.status() == WL_CONNECTED) {
@@ -229,7 +304,7 @@ void setup() {
   Serial.begin(115200);
   delay(200);
 
-  // SSR pin
+  // SSR
   pinMode(SSR_PIN, OUTPUT);
   digitalWrite(SSR_PIN, LOW);
 
@@ -249,14 +324,21 @@ void setup() {
   unsigned long t0 = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) delay(200);
 
-  Serial.println("\n=== ESP32 HEATER v2 (Dumb Executor) ===");
+  // Init local algorithm buffer
+  for (int i = 0; i < GROSS_BUFFER_SIZE; i++) {
+    localGrossBuffer[i] = 0.0f;
+  }
+
+  Serial.println("\n=== ESP32 HEATER v2 (Server + Local Fallback) ===");
   Serial.print("IP: ");
   Serial.println(WiFi.localIP());
   Serial.print("Server: ");
   Serial.println(SERVER_URL);
+  Serial.println("Offline fallback: ENABLED (same algorithm as server)");
 
-  lastResponseMs = millis();  // Start grace period from boot
+  lastResponseMs = millis();
   lastHalfMs = millis();
+  localLastTickMs = millis();
   pollMeter();
 }
 
@@ -271,16 +353,21 @@ void loop() {
     pollMeter();
   }
 
-  // Send report to server every 1s (offset from meter read)
+  // Check if we should be in SERVER or LOCAL mode
+  updateControlSource();
+
+  // Try sending to server every 1s (even in LOCAL mode - to detect when server comes back)
   if (millis() - lastSendMs >= 1000) {
     lastSendMs = millis();
     ensureWiFi();
     sendReport();
   }
 
-  // Safety check every 1s
-  if (millis() - lastSafetyCheckMs >= 1000) {
-    lastSafetyCheckMs = millis();
-    checkSafety();
+  // Run local algorithm every 1s if in LOCAL mode
+  if (controlSource == SOURCE_LOCAL) {
+    if (millis() - lastLocalTickMs >= 1000) {
+      lastLocalTickMs = millis();
+      runLocalAlgorithm();
+    }
   }
 }
