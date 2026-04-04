@@ -80,3 +80,14 @@ export function addHistoryEntry(entry: HistoryEntry): void {
     store.history.shift();
   }
 }
+
+export function resetStore(): void {
+  const store = getStore();
+  store.grossBuffer.fill(0);
+  store.bufferIndex = 0;
+  store.bufferFull = false;
+  store.pApplied = 0;
+  store.lastRequestMs = 0;
+  store.lastReport = null;
+  store.history = [];
+}

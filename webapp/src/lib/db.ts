@@ -183,6 +183,11 @@ export function getDbStats(): {
   };
 }
 
+export function deleteSince(ts: number): void {
+  const db = getDb();
+  db.prepare("DELETE FROM readings WHERE ts >= ?").run(ts);
+}
+
 export function pruneIfNeeded(): { deleted: number; vacuumed: boolean } {
   const stats = getDbStats();
   if (stats.fileSizeMb < DB_MAX_SIZE_MB) {

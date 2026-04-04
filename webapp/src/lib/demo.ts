@@ -1,7 +1,10 @@
 import { processReport } from "./heater-logic";
+import { resetStore } from "./store";
+import { deleteSince } from "./db";
 
 let demoInterval: ReturnType<typeof setInterval> | null = null;
 let simTime = 0;
+let demoStartedAt = 0;
 
 // Simulation parameters
 let solarBase = 1800;
@@ -64,6 +67,8 @@ export function startDemo(params?: {
   if (params?.noise !== undefined) noiseAmp = params.noise;
   if (params?.spike !== undefined) spikeAmp = params.spike;
 
+  demoStartedAt = Date.now();
+
   // Run at 1 tick per second (real-time simulation)
   demoInterval = setInterval(demoTick, 1000);
   // First tick immediately
@@ -75,7 +80,15 @@ export function stopDemo(): void {
     clearInterval(demoInterval);
     demoInterval = null;
   }
+
+  // Clean up demo data from DB and memory
+  if (demoStartedAt > 0) {
+    deleteSince(demoStartedAt);
+  }
+  resetStore();
+
   simTime = 0;
+  demoStartedAt = 0;
 }
 
 export function isDemoRunning(): boolean {
