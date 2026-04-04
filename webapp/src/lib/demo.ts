@@ -1,0 +1,94 @@
+import { processReport } from "./heater-logic";
+
+let demoInterval: ReturnType<typeof setInterval> | null = null;
+let simTime = 0;
+
+// Simulation parameters
+let solarBase = 1800;
+let houseBase = 600;
+let noiseAmp = 80;
+let spikeAmp = 200;
+
+function getSolar(t: number): number {
+  return (
+    solarBase +
+    Math.sin(t * 0.02) * 150 + // slow cloud drift
+    Math.sin(t * 0.1) * 60 + // medium variation
+    Math.sin(t * 0.33) * 30 // fast flicker
+  );
+}
+
+function getHouse(t: number): number {
+  let h = houseBase + Math.sin(t * 0.05) * 50;
+  if (Math.sin(t * 0.21) > 0.85) h += spikeAmp;
+  if (Math.sin(t * 0.37) > 0.9) h += spikeAmp * 0.6;
+  return h;
+}
+
+function getNoise(): number {
+  return (Math.random() - 0.5) * 2 * noiseAmp;
+}
+
+function demoTick() {
+  simTime++;
+
+  const solar = getSolar(simTime);
+  const house = getHouse(simTime);
+  const noise = getNoise();
+
+  // power_w: positive = import, negative = export (same as DTSU666)
+  const netPower = house - solar + noise;
+
+  processReport({
+    power_w: netPower,
+    uptime_s: simTime,
+    wifi_rssi: -45,
+    free_heap: 32000,
+    current_duty_pct: 0,
+    safe_mode: false,
+    seconds_since_last_response: 0,
+  });
+}
+
+export function startDemo(params?: {
+  solar?: number;
+  house?: number;
+  noise?: number;
+  spike?: number;
+}): void {
+  stopDemo();
+  simTime = 0;
+
+  if (params?.solar !== undefined) solarBase = params.solar;
+  if (params?.house !== undefined) houseBase = params.house;
+  if (params?.noise !== undefined) noiseAmp = params.noise;
+  if (params?.spike !== undefined) spikeAmp = params.spike;
+
+  // Run at 1 tick per second (real-time simulation)
+  demoInterval = setInterval(demoTick, 1000);
+  // First tick immediately
+  demoTick();
+}
+
+export function stopDemo(): void {
+  if (demoInterval) {
+    clearInterval(demoInterval);
+    demoInterval = null;
+  }
+  simTime = 0;
+}
+
+export function isDemoRunning(): boolean {
+  return demoInterval !== null;
+}
+
+export function getDemoParams() {
+  return {
+    running: isDemoRunning(),
+    simTime,
+    solarBase,
+    houseBase,
+    noiseAmp,
+    spikeAmp,
+  };
+}

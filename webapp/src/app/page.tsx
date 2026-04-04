@@ -13,7 +13,16 @@ import {
   Legend,
 } from "recharts";
 
-const APP_VERSION = "2.0.0";
+const APP_VERSION = "2.1.0";
+
+interface DemoState {
+  running: boolean;
+  simTime: number;
+  solarBase: number;
+  houseBase: number;
+  noiseAmp: number;
+  spikeAmp: number;
+}
 
 interface Status {
   mode: "auto" | "manual";
@@ -195,6 +204,11 @@ export default function Dashboard() {
   const [range, setRange] = useState<Range>("1h");
   const [sliderDuty, setSliderDuty] = useState(0);
   const [sliderActive, setSliderActive] = useState(false);
+  const [demo, setDemo] = useState<DemoState | null>(null);
+  const [demoSolar, setDemoSolar] = useState(1800);
+  const [demoHouse, setDemoHouse] = useState(600);
+  const [demoNoise, setDemoNoise] = useState(80);
+  const [demoSpike, setDemoSpike] = useState(200);
 
   // Check if already authenticated
   useEffect(() => {
@@ -261,22 +275,54 @@ export default function Dashboard() {
     fetchStatus();
   };
 
+  const fetchDemo = useCallback(async () => {
+    try {
+      const res = await fetch("/api/demo");
+      if (res.ok) setDemo(await res.json());
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  const startDemo = async () => {
+    await fetch("/api/demo", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        solar: demoSolar,
+        house: demoHouse,
+        noise: demoNoise,
+        spike: demoSpike,
+      }),
+    });
+    setRange("10m");
+    fetchDemo();
+  };
+
+  const stopDemo = async () => {
+    await fetch("/api/demo", { method: "DELETE" });
+    fetchDemo();
+  };
+
   useEffect(() => {
     if (!authed) return;
     fetchStatus();
     fetchHistory();
     fetchStats();
+    fetchDemo();
 
     const statusInterval = setInterval(fetchStatus, 2000);
-    const historyInterval = setInterval(fetchHistory, 15000);
+    const historyInterval = setInterval(fetchHistory, 10000);
     const statsInterval = setInterval(fetchStats, 60000);
+    const demoInterval = setInterval(fetchDemo, 5000);
 
     return () => {
       clearInterval(statusInterval);
       clearInterval(historyInterval);
       clearInterval(statsInterval);
+      clearInterval(demoInterval);
     };
-  }, [authed, fetchStatus, fetchHistory, fetchStats]);
+  }, [authed, fetchStatus, fetchHistory, fetchStats, fetchDemo]);
 
   // Loading
   if (authed === null) return null;
@@ -424,6 +470,118 @@ export default function Dashboard() {
             {status ? formatW(status.gross_export_w) : "-- W"}
           </div>
         </div>
+      </div>
+
+      {/* Demo panel */}
+      <div className="card" style={{ marginBottom: 16 }}>
+        <div
+          style={{
+            display: "flex",
+            gap: 16,
+            alignItems: "center",
+            flexWrap: "wrap",
+          }}
+        >
+          <b style={{ fontSize: "0.9rem" }}>Symulacja</b>
+          {demo?.running ? (
+            <button
+              onClick={stopDemo}
+              style={{
+                padding: "6px 16px",
+                borderRadius: 8,
+                border: "none",
+                background: "var(--red)",
+                color: "white",
+                cursor: "pointer",
+                fontWeight: 600,
+              }}
+            >
+              STOP DEMO
+            </button>
+          ) : (
+            <button
+              onClick={startDemo}
+              style={{
+                padding: "6px 16px",
+                borderRadius: 8,
+                border: "none",
+                background: "var(--green)",
+                color: "black",
+                cursor: "pointer",
+                fontWeight: 600,
+              }}
+            >
+              START DEMO
+            </button>
+          )}
+          {demo?.running && (
+            <span
+              className="badge badge-amber"
+              style={{ fontVariantNumeric: "tabular-nums" }}
+            >
+              Sym: {demo.simTime}s
+            </span>
+          )}
+        </div>
+        {!demo?.running && (
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
+              gap: 12,
+              marginTop: 12,
+            }}
+          >
+            <label style={{ fontSize: "0.8rem", color: "var(--muted)" }}>
+              Produkcja solarna: {demoSolar} W
+              <input
+                type="range"
+                min={500}
+                max={3000}
+                step={50}
+                value={demoSolar}
+                onChange={(e) => setDemoSolar(Number(e.target.value))}
+                style={{ width: "100%", marginTop: 4 }}
+              />
+            </label>
+            <label style={{ fontSize: "0.8rem", color: "var(--muted)" }}>
+              Zuzycie domu: {demoHouse} W
+              <input
+                type="range"
+                min={200}
+                max={1500}
+                step={50}
+                value={demoHouse}
+                onChange={(e) => setDemoHouse(Number(e.target.value))}
+                style={{ width: "100%", marginTop: 4 }}
+              />
+            </label>
+            <label style={{ fontSize: "0.8rem", color: "var(--muted)" }}>
+              Szum odczytu: +/-{demoNoise} W
+              <input
+                type="range"
+                min={0}
+                max={200}
+                step={10}
+                value={demoNoise}
+                onChange={(e) => setDemoNoise(Number(e.target.value))}
+                style={{ width: "100%", marginTop: 4 }}
+              />
+            </label>
+            <label style={{ fontSize: "0.8rem", color: "var(--muted)" }}>
+              Skoki zuzycia: +/-{demoSpike} W
+              <input
+                type="range"
+                min={0}
+                max={500}
+                step={50}
+                value={demoSpike}
+                onChange={(e) => setDemoSpike(Number(e.target.value))}
+                style={{ width: "100%", marginTop: 4 }}
+              />
+            </label>
+          </div>
+        )}
       </div>
 
       {/* Chart 1: Heater + export + gross */}
