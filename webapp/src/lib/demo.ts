@@ -1,5 +1,5 @@
 import { processReport } from "./heater-logic";
-import { resetStore } from "./store";
+import { getStore, resetStore } from "./store";
 import { deleteSince } from "./db";
 
 let demoInterval: ReturnType<typeof setInterval> | null = null;
@@ -35,12 +35,14 @@ function getNoise(): number {
 function demoTick() {
   simTime++;
 
+  const store = getStore();
   const solar = getSolar(simTime);
   const house = getHouse(simTime);
   const noise = getNoise();
 
-  // power_w: positive = import, negative = export (same as DTSU666)
-  const netPower = house - solar + noise;
+  // Meter sees ALL loads including heater: house + heater - solar
+  // positive = import, negative = export (same as DTSU666)
+  const netPower = house + store.pApplied - solar + noise;
 
   processReport({
     power_w: netPower,
