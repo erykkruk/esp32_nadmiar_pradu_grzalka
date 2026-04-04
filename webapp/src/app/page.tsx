@@ -304,6 +304,19 @@ export default function Dashboard() {
     fetchDemo();
   };
 
+  const updateDemoParams = async (params: {
+    solar?: number;
+    house?: number;
+    noise?: number;
+    spike?: number;
+  }) => {
+    await fetch("/api/demo", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(params),
+    });
+  };
+
   useEffect(() => {
     if (!authed) return;
     fetchStatus();
@@ -472,18 +485,28 @@ export default function Dashboard() {
         </div>
       </div>
 
-      {/* Demo panel */}
-      <div className="card" style={{ marginBottom: 16 }}>
-        <div
-          style={{
-            display: "flex",
-            gap: 16,
-            alignItems: "center",
-            flexWrap: "wrap",
-          }}
-        >
-          <b style={{ fontSize: "0.9rem" }}>Symulacja</b>
-          {demo?.running ? (
+      {/* Demo panel - only visible when demo is running */}
+      {demo?.running && (
+        <div className="card" style={{ marginBottom: 16, borderColor: "var(--amber)" }}>
+          <div
+            style={{
+              display: "flex",
+              gap: 16,
+              alignItems: "center",
+              flexWrap: "wrap",
+              marginBottom: 12,
+            }}
+          >
+            <span className="badge badge-amber">DEMO</span>
+            <span
+              style={{
+                fontVariantNumeric: "tabular-nums",
+                fontSize: "0.85rem",
+                color: "var(--muted)",
+              }}
+            >
+              Czas symulacji: {demo.simTime}s
+            </span>
             <button
               onClick={stopDemo}
               style={{
@@ -494,42 +517,17 @@ export default function Dashboard() {
                 color: "white",
                 cursor: "pointer",
                 fontWeight: 600,
+                marginLeft: "auto",
               }}
             >
               STOP DEMO
             </button>
-          ) : (
-            <button
-              onClick={startDemo}
-              style={{
-                padding: "6px 16px",
-                borderRadius: 8,
-                border: "none",
-                background: "var(--green)",
-                color: "black",
-                cursor: "pointer",
-                fontWeight: 600,
-              }}
-            >
-              START DEMO
-            </button>
-          )}
-          {demo?.running && (
-            <span
-              className="badge badge-amber"
-              style={{ fontVariantNumeric: "tabular-nums" }}
-            >
-              Sym: {demo.simTime}s
-            </span>
-          )}
-        </div>
-        {!demo?.running && (
+          </div>
           <div
             style={{
               display: "grid",
               gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
               gap: 12,
-              marginTop: 12,
             }}
           >
             <label style={{ fontSize: "0.8rem", color: "var(--muted)" }}>
@@ -540,7 +538,10 @@ export default function Dashboard() {
                 max={3000}
                 step={50}
                 value={demoSolar}
-                onChange={(e) => setDemoSolar(Number(e.target.value))}
+                onChange={(e) => {
+                  setDemoSolar(Number(e.target.value));
+                  updateDemoParams({ solar: Number(e.target.value) });
+                }}
                 style={{ width: "100%", marginTop: 4 }}
               />
             </label>
@@ -552,7 +553,10 @@ export default function Dashboard() {
                 max={1500}
                 step={50}
                 value={demoHouse}
-                onChange={(e) => setDemoHouse(Number(e.target.value))}
+                onChange={(e) => {
+                  setDemoHouse(Number(e.target.value));
+                  updateDemoParams({ house: Number(e.target.value) });
+                }}
                 style={{ width: "100%", marginTop: 4 }}
               />
             </label>
@@ -564,7 +568,10 @@ export default function Dashboard() {
                 max={200}
                 step={10}
                 value={demoNoise}
-                onChange={(e) => setDemoNoise(Number(e.target.value))}
+                onChange={(e) => {
+                  setDemoNoise(Number(e.target.value));
+                  updateDemoParams({ noise: Number(e.target.value) });
+                }}
                 style={{ width: "100%", marginTop: 4 }}
               />
             </label>
@@ -576,13 +583,16 @@ export default function Dashboard() {
                 max={500}
                 step={50}
                 value={demoSpike}
-                onChange={(e) => setDemoSpike(Number(e.target.value))}
+                onChange={(e) => {
+                  setDemoSpike(Number(e.target.value));
+                  updateDemoParams({ spike: Number(e.target.value) });
+                }}
                 style={{ width: "100%", marginTop: 4 }}
               />
             </label>
           </div>
-        )}
-      </div>
+        </div>
+      )}
 
       {/* Chart 1: Heater + export + gross */}
       <div className="chart-card">
@@ -719,6 +729,22 @@ export default function Dashboard() {
             ? `Dane od: ${new Date(stats.oldestTs).toLocaleDateString("pl-PL")}`
             : "Brak danych"}
         </span>
+        {!demo?.running && (
+          <button
+            onClick={startDemo}
+            style={{
+              padding: "4px 12px",
+              borderRadius: 6,
+              border: "1px solid var(--border)",
+              background: "transparent",
+              color: "var(--muted)",
+              cursor: "pointer",
+              fontSize: "0.75rem",
+            }}
+          >
+            Start Demo
+          </button>
+        )}
         <span>v{APP_VERSION}</span>
       </div>
     </div>

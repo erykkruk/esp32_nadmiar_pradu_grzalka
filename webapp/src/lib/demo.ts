@@ -82,6 +82,18 @@ export function isDemoRunning(): boolean {
   return demoInterval !== null;
 }
 
+export function updateDemoParams(params: {
+  solar?: number;
+  house?: number;
+  noise?: number;
+  spike?: number;
+}): void {
+  if (params.solar !== undefined) solarBase = params.solar;
+  if (params.house !== undefined) houseBase = params.house;
+  if (params.noise !== undefined) noiseAmp = params.noise;
+  if (params.spike !== undefined) spikeAmp = params.spike;
+}
+
 export function getDemoParams() {
   return {
     running: isDemoRunning(),
