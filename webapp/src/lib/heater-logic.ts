@@ -7,9 +7,10 @@ let lastIncreaseMs = 0;
 
 // 3-priority algorithm constants (matching simulation.html)
 const ALPHA_DOWN = 0.7; // Fast filter for decrease (70% new, 30% old)
-const ALPHA_UP = 0.4; // Filter for increase (40% new, 60% old)
-const INCREASE_INTERVAL_MS = 2000; // Increase every 2s
+const ALPHA_UP = 0.15; // Slow filter for increase (15% new, 85% old)
+const INCREASE_INTERVAL_MS = 5000; // Increase every 5s
 const MAX_STEP_W = 200; // Max change per tick [W]
+const ROUND_STEP_W = 100; // Round heater power to nearest 100W
 
 export interface ReportResult {
   duty_pct: number;
@@ -48,6 +49,7 @@ export function processReport(report: EspReport): ReportResult {
     if (gridImport > 0) {
       const cut = gridImport + EXPORT_RESERVE_W;
       store.pApplied = Math.max(0, store.pApplied - cut);
+      store.pApplied = Math.round(store.pApplied / ROUND_STEP_W) * ROUND_STEP_W;
     }
     // PRIORITY 2: Export below reserve → fast proportional reduction
     // Export exists but too small - reduce proportionally to deficit
@@ -55,6 +57,8 @@ export function processReport(report: EspReport): ReportResult {
       const deficit = EXPORT_RESERVE_W - measuredExport;
       const target = Math.max(0, store.pApplied - deficit);
       store.pApplied = ALPHA_DOWN * target + (1 - ALPHA_DOWN) * store.pApplied;
+      store.pApplied = Math.max(0, store.pApplied);
+      store.pApplied = Math.round(store.pApplied / ROUND_STEP_W) * ROUND_STEP_W;
     }
     // PRIORITY 3: Surplus → slow increase (only every 5s)
     // Export > reserve, we can safely increase heater
@@ -68,6 +72,8 @@ export function processReport(report: EspReport): ReportResult {
         if (target > store.pApplied) {
           store.pApplied =
             ALPHA_UP * target + (1 - ALPHA_UP) * store.pApplied;
+          store.pApplied =
+            Math.round(store.pApplied / ROUND_STEP_W) * ROUND_STEP_W;
         }
       }
     }
@@ -76,6 +82,7 @@ export function processReport(report: EspReport): ReportResult {
     const delta = store.pApplied - prevApplied;
     if (delta > MAX_STEP_W) store.pApplied = prevApplied + MAX_STEP_W;
     if (delta < -MAX_STEP_W) store.pApplied = prevApplied - MAX_STEP_W;
+    store.pApplied = Math.round(store.pApplied / ROUND_STEP_W) * ROUND_STEP_W;
 
     // Clamp
     store.pApplied = Math.max(0, Math.min(store.pApplied, P_MAX));
