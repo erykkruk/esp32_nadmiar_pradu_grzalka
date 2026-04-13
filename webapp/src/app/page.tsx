@@ -213,6 +213,7 @@ export default function Dashboard() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [pMaxInput, setPMaxInput] = useState("2000");
   const [pMaxSaving, setPMaxSaving] = useState(false);
+  const [showGrossExport, setShowGrossExport] = useState(false);
 
   // Check if already authenticated
   useEffect(() => {
@@ -346,8 +347,10 @@ export default function Dashboard() {
     fetchStats();
     fetchDemo();
 
+    const historyMs =
+      range === "10m" ? 1000 : range === "1h" ? 5000 : 15000;
     const statusInterval = setInterval(fetchStatus, 200);
-    const historyInterval = setInterval(fetchHistory, 500);
+    const historyInterval = setInterval(fetchHistory, historyMs);
     const statsInterval = setInterval(fetchStats, 60000);
     const demoInterval = setInterval(fetchDemo, 3000);
 
@@ -357,7 +360,7 @@ export default function Dashboard() {
       clearInterval(statsInterval);
       clearInterval(demoInterval);
     };
-  }, [authed, demoRunning, fetchStatus, fetchHistory, fetchStats, fetchDemo]);
+  }, [authed, range, demoRunning, fetchStatus, fetchHistory, fetchStats, fetchDemo]);
 
   // Loading
   if (authed === null) return null;
@@ -712,17 +715,36 @@ export default function Dashboard() {
       {/* Chart 1: Heater + export + gross */}
       <div className="chart-card">
         <div className="chart-header">
-          <span className="chart-title">Moc grzalki, eksport i brutto</span>
-          <div className="range-buttons">
-            {RANGES.map((r) => (
-              <button
-                key={r}
-                className={`range-btn ${range === r ? "active" : ""}`}
-                onClick={() => setRange(r)}
-              >
-                {r}
-              </button>
-            ))}
+          <span className="chart-title">Moc grzalki i eksport</span>
+          <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+            <label
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 4,
+                fontSize: "0.75rem",
+                color: "var(--muted)",
+                cursor: "pointer",
+              }}
+            >
+              <input
+                type="checkbox"
+                checked={showGrossExport}
+                onChange={(e) => setShowGrossExport(e.target.checked)}
+              />
+              Brutto eksport
+            </label>
+            <div className="range-buttons">
+              {RANGES.map((r) => (
+                <button
+                  key={r}
+                  className={`range-btn ${range === r ? "active" : ""}`}
+                  onClick={() => setRange(r)}
+                >
+                  {r}
+                </button>
+              ))}
+            </div>
           </div>
         </div>
         <ResponsiveContainer width="100%" height={300}>
@@ -787,15 +809,17 @@ export default function Dashboard() {
               dot={false}
               name="export_w"
             />
-            <Line
-              type="monotone"
-              dataKey="gross_export_w"
-              stroke="#3b82f6"
-              strokeWidth={1}
-              strokeDasharray="5 5"
-              dot={false}
-              name="gross_export_w"
-            />
+            {showGrossExport && (
+              <Line
+                type="monotone"
+                dataKey="gross_export_w"
+                stroke="#3b82f6"
+                strokeWidth={1}
+                strokeDasharray="5 5"
+                dot={false}
+                name="gross_export_w"
+              />
+            )}
           </LineChart>
         </ResponsiveContainer>
       </div>
