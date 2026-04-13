@@ -1,4 +1,4 @@
-import { P_MAX, EXPORT_RESERVE_W } from "./constants";
+import { EXPORT_RESERVE_W } from "./constants";
 import { getStore, addHistoryEntry, type EspReport } from "./store";
 import { insertReading, pruneIfNeeded } from "./db";
 
@@ -37,7 +37,7 @@ export function processReport(report: EspReport): ReportResult {
   const prevApplied = store.pApplied;
 
   if (store.mode === "manual") {
-    pTarget = (store.manualDuty / 100) * P_MAX;
+    pTarget = (store.manualDuty / 100) * store.pMax;
     store.pApplied = pTarget;
   } else {
     // ============================================================
@@ -67,7 +67,7 @@ export function processReport(report: EspReport): ReportResult {
         lastIncreaseMs = now;
 
         const avgGross = getAverageGross();
-        const target = Math.max(0, Math.min(avgGross - EXPORT_RESERVE_W, P_MAX));
+        const target = Math.max(0, Math.min(avgGross - EXPORT_RESERVE_W, store.pMax));
 
         if (target > store.pApplied) {
           store.pApplied =
@@ -85,14 +85,14 @@ export function processReport(report: EspReport): ReportResult {
     store.pApplied = Math.round(store.pApplied / ROUND_STEP_W) * ROUND_STEP_W;
 
     // Clamp
-    store.pApplied = Math.max(0, Math.min(store.pApplied, P_MAX));
+    store.pApplied = Math.max(0, Math.min(store.pApplied, store.pMax));
     pTarget = store.pApplied;
   }
 
   store.lastRequestMs = now;
 
   // Duty cycle
-  const dutyPct = Math.max(0, Math.min((store.pApplied / P_MAX) * 100, 100));
+  const dutyPct = Math.max(0, Math.min((store.pApplied / store.pMax) * 100, 100));
 
   // Update last report
   store.lastReport = {

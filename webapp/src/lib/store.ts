@@ -1,4 +1,4 @@
-import { GROSS_BUFFER_SIZE, HISTORY_MAX_MEMORY } from "./constants";
+import { GROSS_BUFFER_SIZE, HISTORY_MAX_MEMORY, P_MAX_DEFAULT } from "./constants";
 
 export interface EspReport {
   power_w: number;
@@ -34,6 +34,9 @@ export interface Store {
   // MANUAL mode
   manualDuty: number; // 0-100
 
+  // Settings
+  pMax: number; // Maximum heater power [W]
+
   // Last ESP report
   lastReport: {
     powerW: number;
@@ -58,6 +61,7 @@ function createStore(): Store {
     pApplied: 0,
     lastRequestMs: 0,
     manualDuty: 0,
+    pMax: P_MAX_DEFAULT,
     lastReport: null,
     history: [],
   };

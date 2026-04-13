@@ -13,7 +13,7 @@ import {
   Legend,
 } from "recharts";
 
-const APP_VERSION = "2.4.0";
+const APP_VERSION = "2.5.1";
 
 interface DemoState {
   running: boolean;
@@ -27,6 +27,7 @@ interface DemoState {
 interface Status {
   mode: "auto" | "manual";
   p_applied: number;
+  p_max: number;
   duty_pct: number;
   manual_duty: number;
   export_w: number;
@@ -209,6 +210,9 @@ export default function Dashboard() {
   const [demoHouse, setDemoHouse] = useState(600);
   const [demoNoise, setDemoNoise] = useState(0);
   const [demoSpike, setDemoSpike] = useState(50);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [pMaxInput, setPMaxInput] = useState("2000");
+  const [pMaxSaving, setPMaxSaving] = useState(false);
 
   // Check if already authenticated
   useEffect(() => {
@@ -230,11 +234,14 @@ export default function Dashboard() {
         if (!sliderActive) {
           setSliderDuty(data.manual_duty);
         }
+        if (!settingsOpen) {
+          setPMaxInput(String(data.p_max));
+        }
       }
     } catch {
       /* ignore */
     }
-  }, [sliderActive]);
+  }, [sliderActive, settingsOpen]);
 
   const fetchHistory = useCallback(async () => {
     try {
@@ -315,6 +322,19 @@ export default function Dashboard() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(params),
     });
+  };
+
+  const savePMax = async () => {
+    const value = Number(pMaxInput);
+    if (isNaN(value) || value < 100 || value > 10000) return;
+    setPMaxSaving(true);
+    await fetch("/api/settings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ p_max: value }),
+    });
+    setPMaxSaving(false);
+    fetchStatus();
   };
 
   const demoRunning = demo?.running ?? false;
@@ -457,6 +477,99 @@ export default function Dashboard() {
             </span>
           )}
         </div>
+      </div>
+
+      {/* Settings */}
+      <div className="card" style={{ marginBottom: 16 }}>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            cursor: "pointer",
+          }}
+          onClick={() => setSettingsOpen(!settingsOpen)}
+        >
+          <b>Ustawienia</b>
+          <span
+            style={{
+              color: "var(--muted)",
+              fontSize: "0.85rem",
+              userSelect: "none",
+            }}
+          >
+            {settingsOpen ? "▲" : "▼"}
+          </span>
+        </div>
+        {settingsOpen && (
+          <div style={{ marginTop: 12 }}>
+            <div
+              style={{
+                display: "flex",
+                gap: 12,
+                alignItems: "center",
+                flexWrap: "wrap",
+              }}
+            >
+              <label
+                style={{
+                  fontSize: "0.85rem",
+                  color: "var(--muted)",
+                  whiteSpace: "nowrap",
+                }}
+              >
+                Moc grzalki (W):
+              </label>
+              <input
+                type="number"
+                min={100}
+                max={10000}
+                step={100}
+                value={pMaxInput}
+                onChange={(e) => setPMaxInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") savePMax();
+                }}
+                style={{
+                  width: 120,
+                  padding: "6px 10px",
+                  borderRadius: 8,
+                  border: "1px solid var(--border)",
+                  background: "var(--bg)",
+                  color: "var(--text)",
+                  fontSize: "0.95rem",
+                  fontVariantNumeric: "tabular-nums",
+                }}
+              />
+              <button
+                onClick={savePMax}
+                disabled={pMaxSaving}
+                style={{
+                  padding: "6px 16px",
+                  borderRadius: 8,
+                  border: "none",
+                  background: "var(--blue)",
+                  color: "white",
+                  fontSize: "0.85rem",
+                  cursor: "pointer",
+                  fontWeight: 600,
+                }}
+              >
+                {pMaxSaving ? "..." : "Zapisz"}
+              </button>
+              {status && (
+                <span
+                  style={{
+                    fontSize: "0.8rem",
+                    color: "var(--muted)",
+                  }}
+                >
+                  Aktualna: {status.p_max} W
+                </span>
+              )}
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Value cards */}
