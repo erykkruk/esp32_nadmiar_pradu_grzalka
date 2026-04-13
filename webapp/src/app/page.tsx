@@ -13,7 +13,7 @@ import {
   Legend,
 } from "recharts";
 
-const APP_VERSION = "2.4.0";
+const APP_VERSION = "2.5.1";
 
 interface DemoState {
   running: boolean;
@@ -27,6 +27,7 @@ interface DemoState {
 interface Status {
   mode: "auto" | "manual";
   p_applied: number;
+  p_max: number;
   duty_pct: number;
   manual_duty: number;
   export_w: number;
@@ -209,6 +210,10 @@ export default function Dashboard() {
   const [demoHouse, setDemoHouse] = useState(600);
   const [demoNoise, setDemoNoise] = useState(0);
   const [demoSpike, setDemoSpike] = useState(50);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [pMaxInput, setPMaxInput] = useState("2000");
+  const [pMaxSaving, setPMaxSaving] = useState(false);
+  const [showGrossExport, setShowGrossExport] = useState(false);
 
   // Check if already authenticated
   useEffect(() => {
@@ -230,11 +235,14 @@ export default function Dashboard() {
         if (!sliderActive) {
           setSliderDuty(data.manual_duty);
         }
+        if (!settingsOpen) {
+          setPMaxInput(String(data.p_max));
+        }
       }
     } catch {
       /* ignore */
     }
-  }, [sliderActive]);
+  }, [sliderActive, settingsOpen]);
 
   const fetchHistory = useCallback(async () => {
     try {
@@ -317,6 +325,19 @@ export default function Dashboard() {
     });
   };
 
+  const savePMax = async () => {
+    const value = Number(pMaxInput);
+    if (isNaN(value) || value < 100 || value > 10000) return;
+    setPMaxSaving(true);
+    await fetch("/api/settings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ p_max: value }),
+    });
+    setPMaxSaving(false);
+    fetchStatus();
+  };
+
   const demoRunning = demo?.running ?? false;
 
   useEffect(() => {
@@ -326,8 +347,10 @@ export default function Dashboard() {
     fetchStats();
     fetchDemo();
 
+    const historyMs =
+      range === "10m" ? 1000 : range === "1h" ? 5000 : 15000;
     const statusInterval = setInterval(fetchStatus, 200);
-    const historyInterval = setInterval(fetchHistory, 500);
+    const historyInterval = setInterval(fetchHistory, historyMs);
     const statsInterval = setInterval(fetchStats, 60000);
     const demoInterval = setInterval(fetchDemo, 3000);
 
@@ -337,7 +360,7 @@ export default function Dashboard() {
       clearInterval(statsInterval);
       clearInterval(demoInterval);
     };
-  }, [authed, demoRunning, fetchStatus, fetchHistory, fetchStats, fetchDemo]);
+  }, [authed, range, demoRunning, fetchStatus, fetchHistory, fetchStats, fetchDemo]);
 
   // Loading
   if (authed === null) return null;
@@ -457,6 +480,99 @@ export default function Dashboard() {
             </span>
           )}
         </div>
+      </div>
+
+      {/* Settings */}
+      <div className="card" style={{ marginBottom: 16 }}>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            cursor: "pointer",
+          }}
+          onClick={() => setSettingsOpen(!settingsOpen)}
+        >
+          <b>Ustawienia</b>
+          <span
+            style={{
+              color: "var(--muted)",
+              fontSize: "0.85rem",
+              userSelect: "none",
+            }}
+          >
+            {settingsOpen ? "▲" : "▼"}
+          </span>
+        </div>
+        {settingsOpen && (
+          <div style={{ marginTop: 12 }}>
+            <div
+              style={{
+                display: "flex",
+                gap: 12,
+                alignItems: "center",
+                flexWrap: "wrap",
+              }}
+            >
+              <label
+                style={{
+                  fontSize: "0.85rem",
+                  color: "var(--muted)",
+                  whiteSpace: "nowrap",
+                }}
+              >
+                Moc grzalki (W):
+              </label>
+              <input
+                type="number"
+                min={100}
+                max={10000}
+                step={100}
+                value={pMaxInput}
+                onChange={(e) => setPMaxInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") savePMax();
+                }}
+                style={{
+                  width: 120,
+                  padding: "6px 10px",
+                  borderRadius: 8,
+                  border: "1px solid var(--border)",
+                  background: "var(--bg)",
+                  color: "var(--text)",
+                  fontSize: "0.95rem",
+                  fontVariantNumeric: "tabular-nums",
+                }}
+              />
+              <button
+                onClick={savePMax}
+                disabled={pMaxSaving}
+                style={{
+                  padding: "6px 16px",
+                  borderRadius: 8,
+                  border: "none",
+                  background: "var(--blue)",
+                  color: "white",
+                  fontSize: "0.85rem",
+                  cursor: "pointer",
+                  fontWeight: 600,
+                }}
+              >
+                {pMaxSaving ? "..." : "Zapisz"}
+              </button>
+              {status && (
+                <span
+                  style={{
+                    fontSize: "0.8rem",
+                    color: "var(--muted)",
+                  }}
+                >
+                  Aktualna: {status.p_max} W
+                </span>
+              )}
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Value cards */}
@@ -596,20 +712,39 @@ export default function Dashboard() {
         </div>
       )}
 
-      {/* Chart 1: Heater + export + gross */}
+      {/* Chart 1: Heater + export */}
       <div className="chart-card">
         <div className="chart-header">
-          <span className="chart-title">Moc grzalki, eksport i brutto</span>
-          <div className="range-buttons">
-            {RANGES.map((r) => (
-              <button
-                key={r}
-                className={`range-btn ${range === r ? "active" : ""}`}
-                onClick={() => setRange(r)}
-              >
-                {r}
-              </button>
-            ))}
+          <span className="chart-title">Moc grzalki i eksport</span>
+          <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+            <label
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 4,
+                fontSize: "0.75rem",
+                color: "var(--muted)",
+                cursor: "pointer",
+              }}
+            >
+              <input
+                type="checkbox"
+                checked={showGrossExport}
+                onChange={(e) => setShowGrossExport(e.target.checked)}
+              />
+              Brutto eksport
+            </label>
+            <div className="range-buttons">
+              {RANGES.map((r) => (
+                <button
+                  key={r}
+                  className={`range-btn ${range === r ? "active" : ""}`}
+                  onClick={() => setRange(r)}
+                >
+                  {r}
+                </button>
+              ))}
+            </div>
           </div>
         </div>
         <ResponsiveContainer width="100%" height={300}>
@@ -674,15 +809,17 @@ export default function Dashboard() {
               dot={false}
               name="export_w"
             />
-            <Line
-              type="monotone"
-              dataKey="gross_export_w"
-              stroke="#3b82f6"
-              strokeWidth={1}
-              strokeDasharray="5 5"
-              dot={false}
-              name="gross_export_w"
-            />
+            {showGrossExport && (
+              <Line
+                type="monotone"
+                dataKey="gross_export_w"
+                stroke="#3b82f6"
+                strokeWidth={1}
+                strokeDasharray="5 5"
+                dot={false}
+                name="gross_export_w"
+              />
+            )}
           </LineChart>
         </ResponsiveContainer>
       </div>

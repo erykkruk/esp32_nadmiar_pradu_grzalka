@@ -1,6 +1,5 @@
 import { NextResponse } from "next/server";
 import { getStore } from "@/lib/store";
-import { P_MAX } from "@/lib/constants";
 
 export const dynamic = "force-dynamic";
 
@@ -19,11 +18,12 @@ export async function GET() {
   return NextResponse.json({
     mode: store.mode,
     p_applied: Math.round(store.pApplied * 10) / 10,
+    p_max: store.pMax,
     p_target:
       store.mode === "manual"
-        ? (store.manualDuty / 100) * P_MAX
+        ? (store.manualDuty / 100) * store.pMax
         : store.pApplied,
-    duty_pct: Math.round((store.pApplied / P_MAX) * 1000) / 10,
+    duty_pct: Math.round((store.pApplied / store.pMax) * 1000) / 10,
     manual_duty: store.manualDuty,
     export_w: Math.round(measuredExport * 10) / 10,
     grid_import_w: Math.round(gridImport * 10) / 10,
